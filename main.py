@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="FacelessAI Video Generator", version="1.1")
+app = FastAPI(title="FacelessAI Video Generator", version="1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,7 +75,7 @@ jobs: dict = {}
 async def root():
     return {
         "service": "FacelessAI Video Generator",
-        "version": "1.1",
+        "version": "1.2",
         "status": "running",
         "ffmpeg": check_ffmpeg()
     }
@@ -171,7 +171,7 @@ async def process_video(job_id: str, req: VideoRequest):
         clip_paths = []
 
         async with httpx.AsyncClient(
-            timeout=60,
+            timeout=120,
             follow_redirects=True,
             headers=DOWNLOAD_HEADERS   # ← FIX: browser headers so Pexels allows download
         ) as client:
@@ -201,6 +201,7 @@ async def process_video(job_id: str, req: VideoRequest):
 
         for i, clip_path in enumerate(clip_paths):
             out_path = job_dir / f"proc_{i}.mp4"
+            # Simple crop+scale without zoompan (more reliable with Pexels clips)
             cmd = [
                 "ffmpeg", "-y",
                 "-i", clip_path,
@@ -208,27 +209,41 @@ async def process_video(job_id: str, req: VideoRequest):
                 "-vf", (
                     "crop=in_h*9/16:in_h,"
                     "scale=1080:1920:force_original_aspect_ratio=increase,"
-                    "crop=1080:1920,"
-                    f"zoompan=z='min(zoom+0.0015,1.5)':d={int(clip_duration*30)}:s=1080x1920"
+                    "crop=1080:1920"
                 ),
                 "-r", str(req.fps),
+                "-vsync", "cfr",
                 "-an",
                 "-c:v", "libx264",
                 "-preset", "fast",
                 "-crf", "23",
+                "-pix_fmt", "yuv420p",
                 str(out_path)
             ]
             result = subprocess.run(cmd, capture_output=True)
             if result.returncode != 0:
-                print(f"Warning: clip {i} FFmpeg error — {result.stderr.decode()[-100:]}")
-                # Try simpler fallback without zoompan
-                cmd_simple = [
-                    "ffmpeg", "-y", "-i", clip_path, "-t", str(clip_duration),
-                    "-vf", "crop=in_h*9/16:in_h,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-                    "-r", str(req.fps), "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                err_msg = result.stderr.decode()[-200:]
+                print(f"Warning clip {i}: {err_msg}")
+                # Fallback: re-encode with more permissive flags
+                cmd_fallback = [
+                    "ffmpeg", "-y",
+                    "-fflags", "+genpts",
+                    "-i", clip_path,
+                    "-t", str(clip_duration),
+                    "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+                    "-r", str(req.fps),
+                    "-vsync", "cfr",
+                    "-an",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-crf", "28",
+                    "-pix_fmt", "yuv420p",
                     str(out_path)
                 ]
-                subprocess.run(cmd_simple, capture_output=True, check=True)
+                result2 = subprocess.run(cmd_fallback, capture_output=True)
+                if result2.returncode != 0:
+                    print(f"Skipping clip {i} — both attempts failed")
+                    continue
             processed_clips.append(str(out_path))
 
         update("processing", 65, "Clips procesados — concatenando...")
