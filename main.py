@@ -1,8 +1,6 @@
 from __future__ import annotations
 """
-FacelessAI Backend v1.4 — Fix concat error
-FastAPI + FFmpeg + Pexels
-Fix: clips procesados siempre sin audio (-an), concat video-only, audio en compose final
+FacelessAI Backend v1.5 — Simplified pipeline, full diagnostic logging
 """
 
 import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess, shutil
@@ -10,47 +8,32 @@ from pathlib import Path
 from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="FacelessAI Video Generator", version="1.4")
+app = FastAPI(title="FacelessAI", version="1.5")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "facelessai"
 TEMP_DIR.mkdir(exist_ok=True)
 
 DOWNLOAD_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.pexels.com/", "Origin": "https://www.pexels.com",
-}
-
-# ─── LOCAL MUSIC LIBRARY ──────────────────────────────────────
-MUSIC_LIBRARY = {
-    "finanzas":   ["https://cdn.pixabay.com/audio/2024/01/08/audio_d0c6ff1c60.mp3"],
-    "motivacion": ["https://cdn.pixabay.com/audio/2023/03/09/audio_42009f8537.mp3"],
-    "truecrime":  ["https://cdn.pixabay.com/audio/2023/10/30/audio_831c9b03d6.mp3"],
-    "tecnologia": ["https://cdn.pixabay.com/audio/2023/05/16/audio_7d1ef0b4a3.mp3"],
-    "historia":   ["https://cdn.pixabay.com/audio/2023/09/04/audio_3c7b1e5f8a.mp3"],
-    "cripto":     ["https://cdn.pixabay.com/audio/2023/06/12/audio_8e4f2b6c9d.mp3"],
-    "drama":      ["https://cdn.pixabay.com/audio/2023/08/21/audio_2f9b4c7e1a.mp3"],
-    "default":    ["https://cdn.pixabay.com/audio/2023/04/18/audio_5b8c3a1e7f.mp3"],
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "*/*", "Referer": "https://www.pexels.com/",
 }
 
 class VideoRequest(BaseModel):
     audio_url: str = ""
     audio_b64: Optional[str] = None
     pexels_clips: List[str]
-    script: str
-    title: str
+    script: str = ""
+    title: str = ""
     lang: str = "es"
     niche: str = "default"
-    ratio: str = "9:16"
-    resolution: str = "1080x1920"
     fps: int = 30
     subtitle_style: str = "capcut"
-    add_music: bool = True
+    add_music: bool = False      # disabled by default — enable once base works
     music_volume: float = 0.08
     zoom_effect: bool = True
     pixabay_key: str = ""
@@ -66,24 +49,68 @@ class StatusResponse(BaseModel):
 
 jobs: dict = {}
 
-# ─── ENDPOINTS ───────────────────────────────────────────────
+# ─── HEALTH + DIAGNOSTICS ────────────────────────────────────
 
 @app.get("/")
 async def root():
-    return {"service": "FacelessAI", "version": "1.4",
-            "features": ["capcut_subtitles", "auto_music", "dynamic_zoom", "thumbnail", "yt_analytics"],
-            "ffmpeg": check_ffmpeg()}
+    return {"service": "FacelessAI", "version": "1.5", "ffmpeg": check_ffmpeg()}
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.4", "ffmpeg": check_ffmpeg()}
+    return {"status": "ok", "version": "1.5", "ffmpeg": check_ffmpeg()}
 
 def check_ffmpeg():
     try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
-        return "available" if r.returncode == 0 else "not found"
-    except FileNotFoundError:
-        return "not installed"
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        first_line = r.stdout.split("\n")[0] if r.stdout else "unknown"
+        return first_line if r.returncode == 0 else "not found"
+    except Exception as e:
+        return f"error: {e}"
+
+@app.get("/diag")
+async def diag():
+    """Diagnostic endpoint — call this to verify FFmpeg works on Railway."""
+    results = {}
+
+    # 1. FFmpeg version
+    r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=10)
+    results["ffmpeg_version"] = r.stdout.split("\n")[0] if r.returncode == 0 else f"FAIL: {r.stderr[:100]}"
+
+    # 2. FFprobe
+    r2 = subprocess.run(["ffprobe", "-version"], capture_output=True, text=True, timeout=10)
+    results["ffprobe"] = "ok" if r2.returncode == 0 else f"FAIL: {r2.stderr[:100]}"
+
+    # 3. Generate a test video (black 3s)
+    test_out = TEMP_DIR / "diag_test.mp4"
+    r3 = subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", "color=black:size=1080x1920:rate=30:duration=3",
+        "-f", "lavfi", "-i", "aevalsrc=0:c=mono:r=44100:d=3",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        str(test_out)
+    ], capture_output=True, timeout=30)
+    if r3.returncode == 0 and test_out.exists():
+        results["test_video"] = f"ok — {test_out.stat().st_size} bytes"
+        test_out.unlink(missing_ok=True)
+    else:
+        results["test_video"] = f"FAIL: {r3.stderr.decode()[-200:]}"
+
+    # 4. Available fonts
+    r4 = subprocess.run(["fc-list"], capture_output=True, text=True, timeout=10)
+    fonts = r4.stdout.strip().split("\n") if r4.returncode == 0 else []
+    results["font_count"] = len(fonts)
+    results["has_liberation"] = any("Liberation" in f for f in fonts)
+    results["has_dejavu"]     = any("DejaVu" in f for f in fonts)
+    results["sample_fonts"]   = fonts[:5]
+
+    # 5. Temp dir
+    results["temp_dir"] = str(TEMP_DIR)
+    results["temp_writable"] = os.access(str(TEMP_DIR), os.W_OK)
+
+    return JSONResponse(results)
+
+# ─── ENDPOINTS ───────────────────────────────────────────────
 
 @app.post("/generate", response_model=StatusResponse)
 async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
@@ -106,24 +133,22 @@ async def get_status(job_id: str):
 async def download_video(job_id: str):
     if job_id not in jobs or jobs[job_id]["status"] != "done":
         raise HTTPException(status_code=404, detail="Video no disponible")
-    filepath = TEMP_DIR / f"{job_id}_output.mp4"
-    if not filepath.exists():
+    f = TEMP_DIR / f"{job_id}_output.mp4"
+    if not f.exists():
         raise HTTPException(status_code=404, detail="Archivo no encontrado")
-    return FileResponse(str(filepath), media_type="video/mp4", filename=f"facelessai_{job_id}.mp4")
+    return FileResponse(str(f), media_type="video/mp4", filename=f"facelessai_{job_id}.mp4")
 
 @app.get("/thumbnail/{job_id}")
 async def get_thumbnail(job_id: str):
-    filepath = TEMP_DIR / f"{job_id}_thumb.jpg"
-    if not filepath.exists():
+    f = TEMP_DIR / f"{job_id}_thumb.jpg"
+    if not f.exists():
         raise HTTPException(status_code=404, detail="Thumbnail no disponible")
-    return FileResponse(str(filepath), media_type="image/jpeg")
+    return FileResponse(str(f), media_type="image/jpeg")
 
-# ─── YOUTUBE ANALYTICS (OAuth proxy) ─────────────────────────
+# ─── YOUTUBE ANALYTICS ───────────────────────────────────────
 
 @app.get("/yt/channel-stats")
 async def yt_channel_stats(channel_id: str, access_token: str):
-    if not access_token or not channel_id:
-        raise HTTPException(status_code=400, detail="channel_id y access_token requeridos")
     try:
         async with httpx.AsyncClient(timeout=15) as cl:
             r = await cl.get(
@@ -138,14 +163,14 @@ async def yt_channel_stats(channel_id: str, access_token: str):
             if not items:
                 raise HTTPException(status_code=404, detail="Canal no encontrado")
             ch = items[0]
-            stats = ch.get("statistics", {})
+            s  = ch.get("statistics", {})
             return {
                 "channel_id": channel_id,
-                "title": ch.get("snippet", {}).get("title", ""),
-                "subscribers": int(stats.get("subscriberCount", 0)),
-                "total_views": int(stats.get("viewCount", 0)),
-                "video_count": int(stats.get("videoCount", 0)),
-                "thumbnail": ch.get("snippet", {}).get("thumbnails", {}).get("default", {}).get("url", ""),
+                "title":       ch.get("snippet", {}).get("title", ""),
+                "subscribers": int(s.get("subscriberCount", 0)),
+                "total_views": int(s.get("viewCount", 0)),
+                "video_count": int(s.get("videoCount", 0)),
+                "thumbnail":   ch.get("snippet", {}).get("thumbnails", {}).get("default", {}).get("url", ""),
             }
     except HTTPException:
         raise
@@ -154,8 +179,6 @@ async def yt_channel_stats(channel_id: str, access_token: str):
 
 @app.get("/yt/recent-videos")
 async def yt_recent_videos(channel_id: str, access_token: str, max_results: int = 10):
-    if not access_token or not channel_id:
-        raise HTTPException(status_code=400, detail="channel_id y access_token requeridos")
     try:
         async with httpx.AsyncClient(timeout=20) as cl:
             ch_r = await cl.get(
@@ -177,26 +200,20 @@ async def yt_recent_videos(channel_id: str, access_token: str, max_results: int 
             video_ids = [it["contentDetails"]["videoId"] for it in pl_r.json().get("items", [])]
             if not video_ids:
                 return {"videos": []}
-            stats_r = await cl.get(
+            sr = await cl.get(
                 "https://www.googleapis.com/youtube/v3/videos",
-                params={"part": "statistics,snippet,contentDetails", "id": ",".join(video_ids)},
+                params={"part": "statistics,snippet", "id": ",".join(video_ids)},
                 headers={"Authorization": f"Bearer {access_token}"}
             )
-            stats_r.raise_for_status()
-            videos = []
-            for v in stats_r.json().get("items", []):
-                s = v.get("statistics", {})
-                sn = v.get("snippet", {})
-                videos.append({
-                    "video_id": v["id"],
-                    "title": sn.get("title", ""),
-                    "published_at": sn.get("publishedAt", ""),
-                    "views": int(s.get("viewCount", 0)),
-                    "likes": int(s.get("likeCount", 0)),
-                    "comments": int(s.get("commentCount", 0)),
-                    "thumbnail": sn.get("thumbnails", {}).get("medium", {}).get("url", ""),
-                })
-            return {"videos": videos, "channel_id": channel_id}
+            sr.raise_for_status()
+            return {"videos": [
+                {"video_id": v["id"],
+                 "title":  v.get("snippet", {}).get("title", ""),
+                 "views":  int(v.get("statistics", {}).get("viewCount", 0)),
+                 "likes":  int(v.get("statistics", {}).get("likeCount", 0)),
+                 "thumbnail": v.get("snippet", {}).get("thumbnails", {}).get("medium", {}).get("url", "")}
+                for v in sr.json().get("items", [])
+            ], "channel_id": channel_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -207,8 +224,11 @@ async def yt_recent_videos(channel_id: str, access_token: str, max_results: int 
 async def process_video(job_id: str, req: VideoRequest):
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(exist_ok=True)
+    log = []  # collect all log lines for debugging
 
     def upd(status, pct, msg):
+        log.append(f"[{pct}%] {msg}")
+        print(f"JOB {job_id} [{pct}%] {msg}")
         jobs[job_id].update({"status": status, "progress": pct, "message": msg})
 
     try:
@@ -217,7 +237,7 @@ async def process_video(job_id: str, req: VideoRequest):
         audio_path = job_dir / "audio.mp3"
         if req.audio_b64:
             audio_path.write_bytes(base64.b64decode(req.audio_b64))
-        elif req.audio_url and req.audio_url.startswith("http"):
+        elif req.audio_url.startswith("http"):
             async with httpx.AsyncClient(timeout=60, headers=DOWNLOAD_HEADERS) as cl:
                 r = await cl.get(req.audio_url)
                 r.raise_for_status()
@@ -225,521 +245,283 @@ async def process_video(job_id: str, req: VideoRequest):
         else:
             raise ValueError("Necesitas audio_b64 o audio_url valida")
 
-        duration = get_audio_duration(str(audio_path))
-        upd("processing", 12, f"Audio OK — {duration:.1f}s")
+        audio_size = audio_path.stat().st_size
+        duration   = get_audio_duration(str(audio_path))
+        upd("processing", 12, f"Audio OK — {duration:.1f}s · {audio_size//1024}KB")
 
-        # STEP 2: Get clips
-        clip_paths = []
-        if req.kling_key and req.script:
-            upd("processing", 15, "Generando clips con Kling AI...")
-            sentences = [s.strip() for s in req.script.split('.') if len(s.strip()) > 20][:4]
-            kling_dur = max(3, int(duration / max(len(sentences), 1)))
-            for i, sentence in enumerate(sentences):
-                upd("processing", 15 + i*5, f"Generando clip Kling {i+1}/{len(sentences)}...")
-                kling_url = await generate_kling_video(sentence[:200], kling_dur, req.kling_key)
-                if kling_url:
-                    async with httpx.AsyncClient(timeout=60) as cl:
-                        r = await cl.get(kling_url)
-                        if r.status_code == 200 and len(r.content) > 1000:
-                            p = job_dir / f"clip_{i}.mp4"
-                            p.write_bytes(r.content)
-                            clip_paths.append(str(p))
+        if duration < 1:
+            raise ValueError(f"Audio invalido o muy corto: {duration}s")
 
-        if not clip_paths:
-            upd("processing", 15, "Descargando clips de Pexels...")
-            clip_paths = await download_clips(req.pexels_clips[:6], job_dir, upd)
-            if not clip_paths:
-                raise ValueError("No se pudieron descargar clips. Verifica las URLs de Pexels.")
-            upd("processing", 38, f"{len(clip_paths)} clips descargados")
+        # STEP 2: Download clips
+        upd("processing", 15, f"Descargando {len(req.pexels_clips)} clips...")
+        raw_clips = await download_clips(req.pexels_clips[:5], job_dir, upd)
+        upd("processing", 38, f"{len(raw_clips)}/{len(req.pexels_clips)} clips descargados")
 
-        # STEP 3: Process clips — ALWAYS strip audio (-an)
-        # This ensures consistent video-only streams for clean concatenation
-        upd("processing", 40, "Procesando clips...")
-        processed = process_clips_no_audio(clip_paths, duration, job_dir, req.fps, req.zoom_effect)
+        if not raw_clips:
+            raise ValueError(
+                f"0 clips descargados de {len(req.pexels_clips)} URLs. "
+                "Verifica que la Pexels API key es válida y las URLs son accesibles."
+            )
+
+        # STEP 3: Process clips to 9:16 portrait, no audio
+        upd("processing", 40, f"Procesando {len(raw_clips)} clips a 9:16...")
+        processed = []
+        clip_dur   = duration / len(raw_clips)
+
+        for i, clip_path in enumerate(raw_clips):
+            out_clip = job_dir / f"clip_proc_{i}.mp4"
+            ok = process_one_clip(clip_path, str(out_clip), clip_dur, req.fps)
+            if ok:
+                processed.append(str(out_clip))
+                size_kb = Path(out_clip).stat().st_size // 1024
+                upd("processing", 40 + i*3, f"Clip {i+1} OK ({size_kb}KB)")
+            else:
+                upd("processing", 40 + i*3, f"Clip {i+1} FALLIDO — omitiendo")
+
         if not processed:
             raise ValueError(
-                f"Todos los clips fallaron al procesarse. "
-                f"Descargados: {len(clip_paths)}, procesados: 0. "
-                f"Verifica que las URLs de Pexels son válidas y accesibles."
+                f"0/{len(raw_clips)} clips procesados correctamente. "
+                "FFmpeg no pudo convertir ningún clip a formato 9:16."
             )
-        upd("processing", 55, f"{len(processed)}/{len(clip_paths)} clips procesados")
+        upd("processing", 58, f"{len(processed)} clips procesados OK")
 
-        # STEP 4: Concatenate video-only
-        upd("processing", 57, "Concatenando video...")
-        concat_path = concatenate_video_only(processed, job_dir)
-        upd("processing", 65, "Video concatenado")
-
-        # STEP 5: Background music
-        music_path = None
-        if req.add_music:
-            upd("processing", 67, "Buscando musica de fondo...")
-            music_path = await get_background_music(req.niche, job_dir, req.pixabay_key)
-            upd("processing", 70, "Musica OK" if music_path else "Sin musica")
-
-        # STEP 6: SRT subtitles
-        upd("processing", 72, "Generando subtitulos...")
-        srt_path = job_dir / "subs.srt"
-        generate_srt(req.script, duration, str(srt_path), req.subtitle_style)
-
-        # STEP 7: Final composition — add voice + music + subtitles to video
-        upd("processing", 75, "Composicion final...")
-
-        # Validate concat output before composing
-        concat_info = probe_video(str(concat_path))
-        audio_size  = audio_path.stat().st_size if audio_path.exists() else 0
-        print(f"compose inputs — video: {concat_info}, audio: {audio_size}b")
-        if not concat_info["valid"] or concat_info["width"] == 0:
+        # STEP 4: Concatenate
+        upd("processing", 60, f"Concatenando {len(processed)} clips...")
+        concat_path = job_dir / "concat.mp4"
+        concat_ok   = concatenate_clips(processed, str(concat_path))
+        if not concat_ok or not concat_path.exists() or concat_path.stat().st_size < 1000:
             raise ValueError(
-                f"concat.mp4 invalido antes de compose: {concat_info}. "
-                f"clips_descargados={len(clip_paths)}, clips_procesados={len(processed)}"
+                f"Concatenación fallida. concat.mp4 size={concat_path.stat().st_size if concat_path.exists() else 0}"
             )
-        if audio_size < 1000:
-            raise ValueError(f"audio.mp3 invalido: {audio_size} bytes")
+        concat_dur = get_audio_duration(str(concat_path))
+        upd("processing", 65, f"Concat OK — {concat_path.stat().st_size//1024}KB · {concat_dur:.1f}s")
 
+        # STEP 5: Compose — video + audio (simplest possible first)
+        upd("processing", 70, "Composicion: video + audio...")
         output_path = TEMP_DIR / f"{job_id}_output.mp4"
-        compose_final(str(concat_path), str(audio_path), str(srt_path),
-                      music_path, str(output_path), duration,
-                      req.subtitle_style, req.music_volume)
 
-        # STEP 8: Thumbnail
+        composed = compose_video_audio(str(concat_path), str(audio_path), str(output_path), duration)
+        if not composed:
+            raise ValueError("compose_video_audio falló — ver logs de Railway para detalle")
+
+        out_size = output_path.stat().st_size
+        upd("processing", 90, f"Video compuesto OK — {out_size//1024}KB")
+
+        # STEP 6: Thumbnail
         upd("processing", 95, "Generando thumbnail...")
         thumb_path = TEMP_DIR / f"{job_id}_thumb.jpg"
-        generate_thumbnail(str(output_path), str(thumb_path))
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(output_path),
+            "-ss", "1", "-vframes", "1", "-vf", "scale=540:960", "-q:v", "3",
+            str(thumb_path)
+        ], capture_output=True, timeout=15)
 
-        file_mb = output_path.stat().st_size / 1024 / 1024
         jobs[job_id].update({
             "status": "done", "progress": 100,
-            "message": f"Video listo — {duration:.1f}s · {file_mb:.1f}MB",
+            "message": f"Video listo — {duration:.1f}s · {out_size//1024}KB",
             "download_url": f"/download/{job_id}",
             "thumbnail_url": f"/thumbnail/{job_id}" if thumb_path.exists() else None,
         })
+        print(f"JOB {job_id} DONE — {out_size//1024}KB")
         shutil.rmtree(str(job_dir), ignore_errors=True)
 
-    except subprocess.CalledProcessError as e:
-        err = e.stderr.decode() if e.stderr else str(e)
-        jobs[job_id].update({"status": "error", "progress": 0, "message": f"FFmpeg error: {err[-300:]}"})
     except Exception as e:
-        jobs[job_id].update({"status": "error", "progress": 0, "message": f"Error: {str(e)}"})
+        err_msg = str(e)
+        print(f"JOB {job_id} ERROR: {err_msg}")
+        print(f"LOG:\n" + "\n".join(log))
+        jobs[job_id].update({
+            "status": "error", "progress": 0,
+            "message": f"Error: {err_msg[:400]}"
+        })
 
 # ─── HELPERS ─────────────────────────────────────────────────
 
-async def download_clips(urls, job_dir, upd):
+async def download_clips(urls: list, job_dir: Path, upd) -> list:
     paths = []
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True, headers=DOWNLOAD_HEADERS) as cl:
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=DOWNLOAD_HEADERS) as cl:
         for i, url in enumerate(urls):
             try:
-                upd("processing", 15 + i * 4, f"Descargando clip {i+1}/{len(urls)}...")
-                r = await cl.get(url)
+                upd("processing", 15 + i*4, f"Descargando clip {i+1}/{len(urls)}...")
+                r = await cl.get(url, timeout=30)
                 r.raise_for_status()
-                if len(r.content) < 1000:
+                if len(r.content) < 5000:
+                    print(f"Clip {i} too small ({len(r.content)} bytes) — skipping")
                     continue
-                p = job_dir / f"clip_{i}.mp4"
+                p = job_dir / f"raw_{i}.mp4"
                 p.write_bytes(r.content)
+                print(f"Clip {i} downloaded: {len(r.content)//1024}KB")
                 paths.append(str(p))
             except Exception as e:
-                print(f"Clip {i} error: {e}")
+                print(f"Clip {i} download error: {e}")
     return paths
 
 
-def probe_video(path: str) -> dict:
-    """Get video info via ffprobe. Returns dict with width, height, duration."""
+def process_one_clip(input_path: str, output_path: str, duration: float, fps: int) -> bool:
+    """Convert one clip to 1080x1920 portrait, no audio. 3 attempts."""
+
+    # Probe input
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", input_path],
+        capture_output=True, text=True, timeout=10
+    )
     try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_streams", "-show_format", path],
-            capture_output=True, text=True, timeout=10
-        )
-        data = json.loads(r.stdout)
-        video_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
-        return {
-            "width":    int(video_stream.get("width", 0)),
-            "height":   int(video_stream.get("height", 0)),
-            "duration": float(data.get("format", {}).get("duration", 0)),
-            "codec":    video_stream.get("codec_name", "unknown"),
-            "valid":    bool(video_stream),
-        }
-    except Exception as e:
-        print(f"probe_video error: {e}")
-        return {"width": 0, "height": 0, "duration": 0, "codec": "unknown", "valid": False}
+        streams = json.loads(probe.stdout).get("streams", [])
+        vs = next((s for s in streams if s.get("codec_type") == "video"), {})
+        w, h = int(vs.get("width", 0)), int(vs.get("height", 0))
+        print(f"  Clip {input_path[-20:]}: {w}x{h}")
+    except Exception:
+        w, h = 0, 0
+
+    # Build vf based on orientation
+    if w > 0 and h > 0 and w > h:
+        # Landscape → crop to portrait then scale
+        vf = "crop=ih*9/16:ih,scale=1080:1920"
+    else:
+        # Portrait or unknown → scale with padding
+        vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
+
+    base_cmd = [
+        "ffmpeg", "-y",
+        "-fflags", "+genpts+igndts",
+        "-i", input_path,
+        "-t", str(min(duration + 1, 60)),
+        "-r", str(fps), "-vsync", "cfr",
+        "-an",
+        "-pix_fmt", "yuv420p",
+    ]
+
+    # Attempt 1: with smart vf
+    r1 = subprocess.run(
+        base_cmd + ["-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "23", output_path],
+        capture_output=True, timeout=60
+    )
+    if r1.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 1000:
+        return True
+    print(f"  Attempt 1 fail: {r1.stderr.decode()[-150:]}")
+
+    # Attempt 2: simple scale only
+    if Path(output_path).exists():
+        Path(output_path).unlink()
+    r2 = subprocess.run(
+        base_cmd + ["-vf", "scale=1080:1920", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", output_path],
+        capture_output=True, timeout=60
+    )
+    if r2.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 1000:
+        return True
+    print(f"  Attempt 2 fail: {r2.stderr.decode()[-150:]}")
+
+    # Attempt 3: no vf at all, just re-encode
+    if Path(output_path).exists():
+        Path(output_path).unlink()
+    r3 = subprocess.run(
+        ["ffmpeg", "-y", "-fflags", "+genpts+igndts+discardcorrupt",
+         "-i", input_path, "-t", str(min(duration + 1, 60)),
+         "-r", str(fps), "-an", "-c:v", "libx264", "-preset", "ultrafast",
+         "-crf", "30", "-pix_fmt", "yuv420p", output_path],
+        capture_output=True, timeout=60
+    )
+    if r3.returncode == 0 and Path(output_path).exists() and Path(output_path).stat().st_size > 1000:
+        return True
+    print(f"  Attempt 3 fail: {r3.stderr.decode()[-150:]}")
+    return False
 
 
-def process_clips_no_audio(clip_paths: list, total_duration: float,
-                            job_dir: Path, fps: int, zoom_effect: bool) -> list:
-    """
-    Process clips to 9:16 vertical, always strip audio (-an).
-    Probes each clip first and picks the safest filter for its dimensions.
-    """
-    processed = []
-    clip_dur = total_duration / max(len(clip_paths), 1)
-
-    for i, path in enumerate(clip_paths):
-        out  = job_dir / f"proc_{i}.mp4"
-
-        # Probe clip to understand its dimensions
-        info = probe_video(path)
-        print(f"Clip {i}: {info['width']}x{info['height']} {info['codec']} {info['duration']:.1f}s valid={info['valid']}")
-
-        if not info["valid"]:
-            print(f"Clip {i} invalid — skipping")
-            continue
-
-        w, h = info["width"], info["height"]
-
-        # Choose safest vf based on actual dimensions
-        # Goal: get 1080x1920 (9:16 portrait)
-        if w > 0 and h > 0:
-            if w >= h:
-                # Landscape — crop center portrait slice
-                vf = "crop=ih*9/16:ih,scale=1080:1920"
-            else:
-                # Portrait — just scale
-                vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
-
-            # Add subtle zoom if requested (only on landscape clips)
-            if zoom_effect and w >= h:
-                zooms = [
-                    "crop=ih*9/16:ih,scale=1166:2074,crop=1080:1920:43:77",
-                    "crop=ih*9/16:ih,scale=1200:2133,crop=1080:1920:60:107",
-                    "crop=ih*9/16:ih,scale=1080:1920",
-                    "crop=ih*9/16:ih,scale=1166:2074,crop=1080:1920:86:77",
-                    "crop=ih*9/16:ih,scale=1166:2074,crop=1080:1920:0:77",
-                ]
-                vf = zooms[i % len(zooms)]
-        else:
-            vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
-
-        # Attempt 1: smart vf
-        cmd1 = [
-            "ffmpeg", "-y",
-            "-fflags", "+genpts+igndts",
-            "-i", path,
-            "-t", str(clip_dur),
-            "-vf", vf,
-            "-r", str(fps), "-vsync", "cfr",
-            "-an",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
-            str(out)
-        ]
-        r1 = subprocess.run(cmd1, capture_output=True)
-        if r1.returncode == 0 and out.exists() and out.stat().st_size > 1000:
-            print(f"Clip {i} OK (smart vf)")
-            processed.append(str(out))
-            continue
-        print(f"Clip {i} attempt 1 failed: {r1.stderr.decode()[-150:]}")
-
-        # Attempt 2: scale only, no crop
-        cmd2 = [
-            "ffmpeg", "-y",
-            "-fflags", "+genpts+igndts",
-            "-i", path,
-            "-t", str(clip_dur),
-            "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-            "-r", str(fps), "-vsync", "cfr",
-            "-an",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
-            str(out)
-        ]
-        r2 = subprocess.run(cmd2, capture_output=True)
-        if r2.returncode == 0 and out.exists() and out.stat().st_size > 1000:
-            print(f"Clip {i} OK (scale fallback)")
-            processed.append(str(out))
-            continue
-        print(f"Clip {i} attempt 2 failed: {r2.stderr.decode()[-150:]}")
-
-        # Attempt 3: re-encode with minimal options
-        cmd3 = [
-            "ffmpeg", "-y",
-            "-fflags", "+genpts+igndts+discardcorrupt",
-            "-err_detect", "ignore_err",
-            "-i", path,
-            "-t", str(clip_dur),
-            "-vf", "scale=1080:1920",
-            "-r", str(fps),
-            "-an",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p",
-            str(out)
-        ]
-        r3 = subprocess.run(cmd3, capture_output=True)
-        if r3.returncode == 0 and out.exists() and out.stat().st_size > 1000:
-            print(f"Clip {i} OK (minimal fallback)")
-            processed.append(str(out))
-            continue
-
-        print(f"Clip {i} ALL ATTEMPTS FAILED — skipping entirely")
-
-    print(f"process_clips_no_audio: {len(processed)}/{len(clip_paths)} clips OK")
-    return processed
-
-
-def concatenate_video_only(paths: list, job_dir: Path) -> Path:
-    """
-    Concatenate video-only streams using concat demuxer.
-    Since all clips are video-only (no audio), this is always clean.
-    """
-    if not paths:
-        raise ValueError("No hay clips para concatenar")
-
-    out = job_dir / "concat.mp4"
-
+def concatenate_clips(paths: list, output: str) -> bool:
+    """Concatenate clips. Returns True on success."""
     if len(paths) == 1:
-        shutil.copy2(paths[0], str(out))
-        return out
+        shutil.copy2(paths[0], output)
+        return True
 
-    # Write concat.txt with proper path escaping
-    cf = job_dir / "concat.txt"
-    lines = []
-    for p in paths:
-        # Escape single quotes in path (rare but safe)
-        safe_p = str(p).replace("'", "'\\''")
-        lines.append(f"file '{safe_p}'")
-    cf.write_text("\n".join(lines), encoding="utf-8")
-
-    print(f"concat.txt contents:\n{cf.read_text()}")
-
-    # Method 1: concat demuxer with copy (fastest, no re-encode needed
-    # since all clips are already h264 yuv420p from process_clips_no_audio)
-    cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(cf),
-        "-c", "copy",
-        str(out)
-    ]
-    r = subprocess.run(cmd, capture_output=True)
-    if r.returncode == 0 and out.exists() and out.stat().st_size > 1000:
-        return out
-
-    print(f"concat copy failed: {r.stderr.decode()[-200:]}")
-
-    # Method 2: concat demuxer with re-encode
-    cmd2 = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(cf),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
-        str(out)
-    ]
-    r2 = subprocess.run(cmd2, capture_output=True)
-    if r2.returncode == 0 and out.exists() and out.stat().st_size > 1000:
-        return out
-
-    print(f"concat re-encode failed: {r2.stderr.decode()[-200:]}")
-
-    # Method 3: filter_complex concat (no audio streams needed)
-    inputs = []
-    filter_parts = []
+    # Method 1: filter_complex (most reliable with mixed clips)
+    inputs, vparts = [], []
     for i, p in enumerate(paths):
         inputs += ["-i", p]
-        filter_parts.append(f"[{i}:v]")
-    filter_str = "".join(filter_parts) + f"concat=n={len(paths)}:v=1:a=0[outv]"
-    cmd3 = (["ffmpeg", "-y"] + inputs +
-            ["-filter_complex", filter_str, "-map", "[outv]",
-             "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
-             str(out)])
-    subprocess.run(cmd3, capture_output=True, check=True)
-    return out
+        vparts.append(f"[{i}:v]")
+    filt = "".join(vparts) + f"concat=n={len(paths)}:v=1:a=0[outv]"
+    r1 = subprocess.run(
+        ["ffmpeg", "-y"] + inputs +
+        ["-filter_complex", filt, "-map", "[outv]",
+         "-r", "30", "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+         output],
+        capture_output=True, timeout=120
+    )
+    if r1.returncode == 0 and Path(output).exists() and Path(output).stat().st_size > 1000:
+        print(f"concat filter_complex OK: {Path(output).stat().st_size//1024}KB")
+        return True
+    print(f"concat filter_complex fail: {r1.stderr.decode()[-200:]}")
+
+    # Method 2: demuxer
+    if Path(output).exists():
+        Path(output).unlink()
+    cf = Path(output).parent / "cl.txt"
+    cf.write_text("\n".join(f"file '{p}'" for p in paths))
+    r2 = subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(cf),
+         "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+         output],
+        capture_output=True, timeout=120
+    )
+    if r2.returncode == 0 and Path(output).exists() and Path(output).stat().st_size > 1000:
+        print(f"concat demuxer OK")
+        return True
+    print(f"concat demuxer fail: {r2.stderr.decode()[-200:]}")
+    return False
 
 
-def compose_final(video: str, audio: str, srt: str, music: Optional[str],
-                  output: str, duration: float, style: str, music_vol: float):
-    """Add voice + optional music + subtitles to the silent video."""
+def compose_video_audio(video: str, audio: str, output: str, duration: float) -> bool:
+    """Simplest possible compose: video + audio, no filters."""
+    # Verify inputs
+    v_size = Path(video).stat().st_size if Path(video).exists() else 0
+    a_size = Path(audio).stat().st_size if Path(audio).exists() else 0
+    print(f"compose_video_audio: video={v_size//1024}KB audio={a_size//1024}KB duration={duration:.1f}s")
 
-    # Verify inputs exist
-    if not Path(video).exists() or Path(video).stat().st_size < 100:
-        raise ValueError(f"Video input invalid or empty: {video}")
-    if not Path(audio).exists() or Path(audio).stat().st_size < 100:
-        raise ValueError(f"Audio input invalid or empty: {audio}")
-
-    sub_filter = get_subtitle_filter(srt, style)
-    has_subs   = Path(srt).exists() and Path(srt).stat().st_size > 10
-
-    def run_compose(vf_filter: Optional[str], use_music: bool) -> bool:
-        """Try one compose variant. Returns True on success."""
-        inputs = ["-i", video, "-i", audio]
-        maps   = ["-map", "0:v:0"]
-        audio_filter = None
-
-        if use_music and music and Path(music).exists():
-            inputs += ["-i", music]
-            audio_filter = (
-                f"[1:a]volume=1.0[v];"
-                f"[2:a]volume={music_vol},aloop=loop=-1:size=2e+09[m];"
-                f"[v][m]amix=inputs=2:duration=first[aout]"
-            )
-            maps += ["-map", "[aout]"]
-        else:
-            maps += ["-map", "1:a:0"]
-
-        cmd = ["ffmpeg", "-y"] + inputs
-        if audio_filter:
-            cmd += ["-filter_complex", audio_filter]
-        cmd += maps
-        cmd += ["-t", str(duration)]
-        if vf_filter:
-            cmd += ["-vf", vf_filter]
-        cmd += [
-            "-c:v", "libx264", "-preset", "fast", "-crf", "21",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
-            "-movflags", "+faststart", output
-        ]
-
-        # Remove any partial output from previous attempt
-        out_path = Path(output)
-        if out_path.exists():
-            out_path.unlink()
-
-        r = subprocess.run(cmd, capture_output=True)
-        if r.returncode == 0 and out_path.exists() and out_path.stat().st_size > 1000:
-            return True
-        stderr_tail = r.stderr.decode()[-300:]
-        print(f"compose attempt failed (rc={r.returncode}): {stderr_tail}")
+    if v_size < 1000:
+        print(f"ERROR: video input too small: {v_size} bytes")
+        return False
+    if a_size < 100:
+        print(f"ERROR: audio input too small: {a_size} bytes")
         return False
 
-    # Try in order: most reliable first
-    # 1. No subs, no music (baseline — should always work)
-    # 2. No subs, with music
-    # 3. Subs, no music
-    # 4. Subs, with music
-    attempts = [
-        (None,                             False),  # baseline — always works
-        (None,                             True),   # add music
-        (sub_filter if has_subs else None, False),  # add subs
-        (sub_filter if has_subs else None, True),   # full
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video,
+        "-i", audio,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-t", str(duration),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "21",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
+        "-movflags", "+faststart",
+        output
     ]
-
-    for vf, use_music in attempts:
-        if run_compose(vf, use_music):
-            return
-
-    raise RuntimeError("compose_final: all attempts failed")
-
-
-async def get_background_music(niche: str, job_dir: Path, api_key: str = "") -> Optional[str]:
-    library_urls = MUSIC_LIBRARY.get(niche, MUSIC_LIBRARY["default"])
-    queries = {"finanzas": "corporate+background", "motivacion": "motivational+upbeat",
-               "truecrime": "dark+suspense", "tecnologia": "electronic+tech",
-               "historia": "epic+cinematic", "cripto": "electronic+beat",
-               "drama": "emotional+piano", "default": "background+calm+music"}
-    query = queries.get(niche, queries["default"])
-
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as cl:
-        for url in library_urls:
-            try:
-                r = await cl.get(url, timeout=15)
-                if r.status_code == 200 and len(r.content) > 5000:
-                    p = job_dir / "music.mp3"
-                    p.write_bytes(r.content)
-                    return str(p)
-            except Exception as e:
-                print(f"Library track failed: {e}")
-
-        if api_key or os.environ.get("PIXABAY_KEY"):
-            try:
-                key = api_key or os.environ.get("PIXABAY_KEY", "")
-                r = await cl.get(f"https://pixabay.com/api/music/?key={key}&q={query}&per_page=5", timeout=10)
-                if r.status_code == 200:
-                    hits = r.json().get("hits", [])
-                    if hits:
-                        track = random.choice(hits[:3])
-                        audio_url = (track.get("audio", {}).get("medium", {}).get("url")
-                                     or track.get("preview_url", ""))
-                        if audio_url:
-                            mr = await cl.get(audio_url, timeout=25)
-                            if mr.status_code == 200 and len(mr.content) > 5000:
-                                p = job_dir / "music.mp3"
-                                p.write_bytes(mr.content)
-                                return str(p)
-            except Exception as e:
-                print(f"Pixabay API error: {e}")
-
-    return None
-
-
-async def generate_kling_video(prompt: str, duration: int, api_key: str) -> Optional[str]:
-    if not api_key:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=120) as cl:
-            r = await cl.post(
-                "https://api.klingai.com/v1/videos/text2video",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"prompt": prompt, "model": "kling-v1", "duration": min(duration, 10),
-                      "aspect_ratio": "9:16", "mode": "std"}
-            )
-            if r.status_code != 200:
-                return None
-            task_id = r.json().get("data", {}).get("task_id")
-            if not task_id:
-                return None
-            for _ in range(40):
-                await asyncio.sleep(3)
-                sr = await cl.get(f"https://api.klingai.com/v1/videos/text2video/{task_id}",
-                                  headers={"Authorization": f"Bearer {api_key}"})
-                data = sr.json().get("data", {})
-                if data.get("task_status") == "succeed":
-                    videos = data.get("task_result", {}).get("videos", [])
-                    return videos[0].get("url") if videos else None
-                if data.get("task_status") in ("failed", "error"):
-                    return None
-    except Exception as e:
-        print(f"Kling error: {e}")
-    return None
-
-
-def generate_thumbnail(video: str, output: str):
-    try:
-        subprocess.run([
-            "ffmpeg", "-y", "-i", video, "-ss", "1", "-vframes", "1",
-            "-vf", "scale=540:960", "-q:v", "3", output
-        ], capture_output=True, timeout=15)
-    except Exception as e:
-        print(f"Thumbnail error: {e}")
+    r = subprocess.run(cmd, capture_output=True, timeout=180)
+    if r.returncode == 0 and Path(output).exists() and Path(output).stat().st_size > 1000:
+        print(f"compose OK: {Path(output).stat().st_size//1024}KB")
+        return True
+    print(f"compose FAIL: {r.stderr.decode()[-400:]}")
+    return False
 
 
 def get_audio_duration(path: str) -> float:
     r = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
-        capture_output=True, text=True
+        capture_output=True, text=True, timeout=10
     )
-    return float(json.loads(r.stdout)["format"]["duration"])
+    try:
+        return float(json.loads(r.stdout)["format"]["duration"])
+    except Exception:
+        return 0.0
 
 
-def generate_srt(script: str, duration: float, output: str, style: str = "capcut"):
-    clean = re.sub(r'\[.*?\]|\#\w+|//.*', '', script)
-    words = ' '.join(clean.split()).split()
-    if not words:
-        words = ["FacelessAI"]
-    cs = {"capcut": 3, "viral": 5, "minimal": 7}.get(style, 3)
-    chunks = [' '.join(words[i:i+cs]) for i in range(0, len(words), cs)]
-    tpc = duration / len(chunks)
-    srt = ""
+def generate_srt(script: str, duration: float, output: str):
+    clean  = re.sub(r'\[.*?\]|\#\w+|//.*', '', script)
+    words  = ' '.join(clean.split()).split() or ["FacelessAI"]
+    chunks = [' '.join(words[i:i+3]) for i in range(0, len(words), 3)]
+    tpc    = duration / len(chunks)
+    srt    = ""
     for i, chunk in enumerate(chunks):
-        start, end = i * tpc, min((i+1) * tpc, duration - 0.05)
-        text = chunk.upper() if style in ("capcut", "viral") else chunk
-        srt += f"{i+1}\n{fmt_t(start)} --> {fmt_t(end)}\n{text}\n\n"
+        s, e = i * tpc, min((i+1) * tpc, duration - 0.05)
+        h_s, m_s, sec_s, ms_s = int(s//3600), int((s%3600)//60), int(s%60), int((s%1)*1000)
+        h_e, m_e, sec_e, ms_e = int(e//3600), int((e%3600)//60), int(e%60), int((e%1)*1000)
+        srt += f"{i+1}\n{h_s:02d}:{m_s:02d}:{sec_s:02d},{ms_s:03d} --> {h_e:02d}:{m_e:02d}:{sec_e:02d},{ms_e:03d}\n{chunk.upper()}\n\n"
     Path(output).write_text(srt, encoding="utf-8")
-
-
-def fmt_t(s: float) -> str:
-    h, m = int(s // 3600), int((s % 3600) // 60)
-    sec, ms = int(s % 60), int((s % 1) * 1000)
-    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
-
-
-def get_subtitle_filter(srt: str, style: str) -> str:
-    safe = srt.replace('\\', '/').replace(':', '\\:')
-    # Use fonts guaranteed available on Railway/Nix Linux:
-    # Liberation Sans Bold (replaces Arial Bold), DejaVu Sans Bold
-    # Impact is NOT installed by default — avoid it
-    if style == "capcut":
-        return (f"subtitles='{safe}':force_style='"
-                "FontName=Liberation Sans,FontSize=26,PrimaryColour=&H00FFFFFF,"
-                "OutlineColour=&H00000000,Outline=4,Shadow=1,"
-                "Alignment=2,MarginV=120,Bold=1,BorderStyle=1'")
-    elif style == "viral":
-        return (f"subtitles='{safe}':force_style='"
-                "FontName=DejaVu Sans,FontSize=22,PrimaryColour=&H0000FFFF,"
-                "OutlineColour=&H00000000,Outline=3,Shadow=2,"
-                "Alignment=2,MarginV=60,Bold=1'")
-    else:
-        return (f"subtitles='{safe}':force_style='"
-                "FontName=DejaVu Sans,FontSize=18,PrimaryColour=&H00FFFFFF,"
-                "OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=40'")
