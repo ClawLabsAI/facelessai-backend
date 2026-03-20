@@ -568,18 +568,28 @@ def compose_final(video: str, audio: str, srt: str, music: Optional[str],
             "-movflags", "+faststart", output
         ]
 
+        # Remove any partial output from previous attempt
+        out_path = Path(output)
+        if out_path.exists():
+            out_path.unlink()
+
         r = subprocess.run(cmd, capture_output=True)
-        if r.returncode == 0 and Path(output).exists() and Path(output).stat().st_size > 1000:
+        if r.returncode == 0 and out_path.exists() and out_path.stat().st_size > 1000:
             return True
-        print(f"compose attempt failed: {r.stderr.decode()[-200:]}")
+        stderr_tail = r.stderr.decode()[-300:]
+        print(f"compose attempt failed (rc={r.returncode}): {stderr_tail}")
         return False
 
-    # Try in order: subs+music → subs only → no subs+music → no subs
+    # Try in order: most reliable first
+    # 1. No subs, no music (baseline — should always work)
+    # 2. No subs, with music
+    # 3. Subs, no music
+    # 4. Subs, with music
     attempts = [
-        (sub_filter if has_subs else None, True),
-        (sub_filter if has_subs else None, False),
-        (None,                             True),
-        (None,                             False),
+        (None,                             False),  # baseline — always works
+        (None,                             True),   # add music
+        (sub_filter if has_subs else None, False),  # add subs
+        (sub_filter if has_subs else None, True),   # full
     ]
 
     for vf, use_music in attempts:
@@ -703,17 +713,20 @@ def fmt_t(s: float) -> str:
 
 def get_subtitle_filter(srt: str, style: str) -> str:
     safe = srt.replace('\\', '/').replace(':', '\\:')
+    # Use fonts guaranteed available on Railway/Nix Linux:
+    # Liberation Sans Bold (replaces Arial Bold), DejaVu Sans Bold
+    # Impact is NOT installed by default — avoid it
     if style == "capcut":
         return (f"subtitles='{safe}':force_style='"
-                "FontName=Impact,FontSize=26,PrimaryColour=&H00FFFFFF,"
+                "FontName=Liberation Sans,FontSize=26,PrimaryColour=&H00FFFFFF,"
                 "OutlineColour=&H00000000,Outline=4,Shadow=1,"
                 "Alignment=2,MarginV=120,Bold=1,BorderStyle=1'")
     elif style == "viral":
         return (f"subtitles='{safe}':force_style='"
-                "FontName=Impact,FontSize=22,PrimaryColour=&H0000FFFF,"
+                "FontName=DejaVu Sans,FontSize=22,PrimaryColour=&H0000FFFF,"
                 "OutlineColour=&H00000000,Outline=3,Shadow=2,"
                 "Alignment=2,MarginV=60,Bold=1'")
     else:
         return (f"subtitles='{safe}':force_style='"
-                "FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,"
+                "FontName=DejaVu Sans,FontSize=18,PrimaryColour=&H00FFFFFF,"
                 "OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=40'")
