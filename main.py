@@ -283,6 +283,19 @@ async def process_video(job_id: str, req: VideoRequest):
 
         # STEP 7: Final composition — add voice + music + subtitles to video
         upd("processing", 75, "Composicion final...")
+
+        # Validate concat output before composing
+        concat_info = probe_video(str(concat_path))
+        audio_size  = audio_path.stat().st_size if audio_path.exists() else 0
+        print(f"compose inputs — video: {concat_info}, audio: {audio_size}b")
+        if not concat_info["valid"] or concat_info["width"] == 0:
+            raise ValueError(
+                f"concat.mp4 invalido antes de compose: {concat_info}. "
+                f"clips_descargados={len(clip_paths)}, clips_procesados={len(processed)}"
+            )
+        if audio_size < 1000:
+            raise ValueError(f"audio.mp3 invalido: {audio_size} bytes")
+
         output_path = TEMP_DIR / f"{job_id}_output.mp4"
         compose_final(str(concat_path), str(audio_path), str(srt_path),
                       music_path, str(output_path), duration,
