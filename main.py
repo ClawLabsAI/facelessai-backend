@@ -257,8 +257,12 @@ async def process_video(job_id: str, req: VideoRequest):
         upd("processing", 40, "Procesando clips...")
         processed = process_clips_no_audio(clip_paths, duration, job_dir, req.fps, req.zoom_effect)
         if not processed:
-            raise ValueError("No se pudieron procesar los clips")
-        upd("processing", 55, f"{len(processed)} clips procesados")
+            raise ValueError(
+                f"Todos los clips fallaron al procesarse. "
+                f"Descargados: {len(clip_paths)}, procesados: 0. "
+                f"Verifica que las URLs de Pexels son válidas y accesibles."
+            )
+        upd("processing", 55, f"{len(processed)}/{len(clip_paths)} clips procesados")
 
         # STEP 4: Concatenate video-only
         upd("processing", 57, "Concatenando video...")
@@ -324,63 +328,133 @@ async def download_clips(urls, job_dir, upd):
     return paths
 
 
+def probe_video(path: str) -> dict:
+    """Get video info via ffprobe. Returns dict with width, height, duration."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-show_format", path],
+            capture_output=True, text=True, timeout=10
+        )
+        data = json.loads(r.stdout)
+        video_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
+        return {
+            "width":    int(video_stream.get("width", 0)),
+            "height":   int(video_stream.get("height", 0)),
+            "duration": float(data.get("format", {}).get("duration", 0)),
+            "codec":    video_stream.get("codec_name", "unknown"),
+            "valid":    bool(video_stream),
+        }
+    except Exception as e:
+        print(f"probe_video error: {e}")
+        return {"width": 0, "height": 0, "duration": 0, "codec": "unknown", "valid": False}
+
+
 def process_clips_no_audio(clip_paths: list, total_duration: float,
                             job_dir: Path, fps: int, zoom_effect: bool) -> list:
     """
     Process clips to 9:16 vertical, always strip audio (-an).
-    This is the KEY FIX: consistent video-only streams = reliable concat.
+    Probes each clip first and picks the safest filter for its dimensions.
     """
     processed = []
     clip_dur = total_duration / max(len(clip_paths), 1)
 
-    # 5 zoom variants for dynamic camera feel
-    zoom_vf = [
-        "scale=1166:2074,crop=1080:1920:43:77",
-        "scale=1200:2133,crop=1080:1920:60:107",
-        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-        "scale=1166:2074,crop=1080:1920:86:77",
-        "scale=1166:2074,crop=1080:1920:0:77",
-    ]
-
     for i, path in enumerate(clip_paths):
-        out = job_dir / f"proc_{i}.mp4"
-        vf  = zoom_vf[i % len(zoom_vf)] if zoom_effect else zoom_vf[2]
+        out  = job_dir / f"proc_{i}.mp4"
 
-        # Primary: crop + zoom, NO audio
-        cmd = [
-            "ffmpeg", "-y", "-i", path,
+        # Probe clip to understand its dimensions
+        info = probe_video(path)
+        print(f"Clip {i}: {info['width']}x{info['height']} {info['codec']} {info['duration']:.1f}s valid={info['valid']}")
+
+        if not info["valid"]:
+            print(f"Clip {i} invalid — skipping")
+            continue
+
+        w, h = info["width"], info["height"]
+
+        # Choose safest vf based on actual dimensions
+        # Goal: get 1080x1920 (9:16 portrait)
+        if w > 0 and h > 0:
+            if w >= h:
+                # Landscape — crop center portrait slice
+                vf = "crop=ih*9/16:ih,scale=1080:1920"
+            else:
+                # Portrait — just scale
+                vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
+
+            # Add subtle zoom if requested (only on landscape clips)
+            if zoom_effect and w >= h:
+                zooms = [
+                    "crop=ih*9/16:ih,scale=1166:2074,crop=1080:1920:43:77",
+                    "crop=ih*9/16:ih,scale=1200:2133,crop=1080:1920:60:107",
+                    "crop=ih*9/16:ih,scale=1080:1920",
+                    "crop=ih*9/16:ih,scale=1166:2074,crop=1080:1920:86:77",
+                    "crop=ih*9/16:ih,scale=1166:2074,crop=1080:1920:0:77",
+                ]
+                vf = zooms[i % len(zooms)]
+        else:
+            vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
+
+        # Attempt 1: smart vf
+        cmd1 = [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts+igndts",
+            "-i", path,
             "-t", str(clip_dur),
             "-vf", vf,
             "-r", str(fps), "-vsync", "cfr",
-            "-an",  # ← STRIP AUDIO — critical for consistent concat
+            "-an",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
             str(out)
         ]
-        r = subprocess.run(cmd, capture_output=True)
-
-        if r.returncode != 0:
-            print(f"Primary failed clip {i}: {r.stderr.decode()[-100:]}")
-            # Fallback: simple pad, NO audio
-            cmd2 = [
-                "ffmpeg", "-y", "-fflags", "+genpts", "-i", path,
-                "-t", str(clip_dur),
-                "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-                "-r", str(fps), "-vsync", "cfr",
-                "-an",  # ← also strip audio in fallback
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
-                str(out)
-            ]
-            r2 = subprocess.run(cmd2, capture_output=True)
-            if r2.returncode != 0:
-                print(f"Skipping clip {i}: both attempts failed")
-                continue
-
-        # Verify output
-        if out.exists() and out.stat().st_size > 1000:
+        r1 = subprocess.run(cmd1, capture_output=True)
+        if r1.returncode == 0 and out.exists() and out.stat().st_size > 1000:
+            print(f"Clip {i} OK (smart vf)")
             processed.append(str(out))
-        else:
-            print(f"Clip {i} output empty, skipping")
+            continue
+        print(f"Clip {i} attempt 1 failed: {r1.stderr.decode()[-150:]}")
 
+        # Attempt 2: scale only, no crop
+        cmd2 = [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts+igndts",
+            "-i", path,
+            "-t", str(clip_dur),
+            "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+            "-r", str(fps), "-vsync", "cfr",
+            "-an",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
+            str(out)
+        ]
+        r2 = subprocess.run(cmd2, capture_output=True)
+        if r2.returncode == 0 and out.exists() and out.stat().st_size > 1000:
+            print(f"Clip {i} OK (scale fallback)")
+            processed.append(str(out))
+            continue
+        print(f"Clip {i} attempt 2 failed: {r2.stderr.decode()[-150:]}")
+
+        # Attempt 3: re-encode with minimal options
+        cmd3 = [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts+igndts+discardcorrupt",
+            "-err_detect", "ignore_err",
+            "-i", path,
+            "-t", str(clip_dur),
+            "-vf", "scale=1080:1920",
+            "-r", str(fps),
+            "-an",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p",
+            str(out)
+        ]
+        r3 = subprocess.run(cmd3, capture_output=True)
+        if r3.returncode == 0 and out.exists() and out.stat().st_size > 1000:
+            print(f"Clip {i} OK (minimal fallback)")
+            processed.append(str(out))
+            continue
+
+        print(f"Clip {i} ALL ATTEMPTS FAILED — skipping entirely")
+
+    print(f"process_clips_no_audio: {len(processed)}/{len(clip_paths)} clips OK")
     return processed
 
 
@@ -454,50 +528,65 @@ def concatenate_video_only(paths: list, job_dir: Path) -> Path:
 def compose_final(video: str, audio: str, srt: str, music: Optional[str],
                   output: str, duration: float, style: str, music_vol: float):
     """Add voice + optional music + subtitles to the silent video."""
-    sub_filter = get_subtitle_filter(srt, style)
 
-    if music and Path(music).exists():
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", video, "-i", audio, "-i", music,
-            "-filter_complex",
-            (f"[1:a]volume=1.0[v];"
-             f"[2:a]volume={music_vol},aloop=loop=-1:size=2e+09[m];"
-             f"[v][m]amix=inputs=2:duration=first[aout]"),
-            "-map", "0:v:0", "-map", "[aout]",
-            "-t", str(duration),
-            "-vf", sub_filter,
+    # Verify inputs exist
+    if not Path(video).exists() or Path(video).stat().st_size < 100:
+        raise ValueError(f"Video input invalid or empty: {video}")
+    if not Path(audio).exists() or Path(audio).stat().st_size < 100:
+        raise ValueError(f"Audio input invalid or empty: {audio}")
+
+    sub_filter = get_subtitle_filter(srt, style)
+    has_subs   = Path(srt).exists() and Path(srt).stat().st_size > 10
+
+    def run_compose(vf_filter: Optional[str], use_music: bool) -> bool:
+        """Try one compose variant. Returns True on success."""
+        inputs = ["-i", video, "-i", audio]
+        maps   = ["-map", "0:v:0"]
+        audio_filter = None
+
+        if use_music and music and Path(music).exists():
+            inputs += ["-i", music]
+            audio_filter = (
+                f"[1:a]volume=1.0[v];"
+                f"[2:a]volume={music_vol},aloop=loop=-1:size=2e+09[m];"
+                f"[v][m]amix=inputs=2:duration=first[aout]"
+            )
+            maps += ["-map", "[aout]"]
+        else:
+            maps += ["-map", "1:a:0"]
+
+        cmd = ["ffmpeg", "-y"] + inputs
+        if audio_filter:
+            cmd += ["-filter_complex", audio_filter]
+        cmd += maps
+        cmd += ["-t", str(duration)]
+        if vf_filter:
+            cmd += ["-vf", vf_filter]
+        cmd += [
             "-c:v", "libx264", "-preset", "fast", "-crf", "21",
             "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
             "-movflags", "+faststart", output
         ]
+
         r = subprocess.run(cmd, capture_output=True)
-        if r.returncode == 0:
+        if r.returncode == 0 and Path(output).exists() and Path(output).stat().st_size > 1000:
+            return True
+        print(f"compose attempt failed: {r.stderr.decode()[-200:]}")
+        return False
+
+    # Try in order: subs+music → subs only → no subs+music → no subs
+    attempts = [
+        (sub_filter if has_subs else None, True),
+        (sub_filter if has_subs else None, False),
+        (None,                             True),
+        (None,                             False),
+    ]
+
+    for vf, use_music in attempts:
+        if run_compose(vf, use_music):
             return
 
-    # No music or music failed
-    cmd2 = [
-        "ffmpeg", "-y",
-        "-i", video, "-i", audio,
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-t", str(duration),
-        "-vf", sub_filter,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "21",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
-        "-movflags", "+faststart", output
-    ]
-    r2 = subprocess.run(cmd2, capture_output=True)
-    if r2.returncode != 0:
-        # Last resort: no subtitles
-        cmd3 = [
-            "ffmpeg", "-y", "-i", video, "-i", audio,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-t", str(duration),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "21",
-            "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart", output
-        ]
-        subprocess.run(cmd3, capture_output=True, check=True)
+    raise RuntimeError("compose_final: all attempts failed")
 
 
 async def get_background_music(niche: str, job_dir: Path, api_key: str = "") -> Optional[str]:
