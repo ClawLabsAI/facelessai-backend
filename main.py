@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 FacelessAI Backend v1.3
 FastAPI + FFmpeg + Pexels
@@ -6,7 +7,7 @@ New: CapCut subtitles, auto music, dynamic zoom, thumbnail generation
 
 import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +29,7 @@ DOWNLOAD_HEADERS = {
 class VideoRequest(BaseModel):
     audio_url: str = ""
     audio_b64: Optional[str] = None
-    pexels_clips: list[str]
+    pexels_clips: List[str]
     script: str
     title: str
     lang: str = "es"
@@ -107,8 +108,6 @@ async def get_thumbnail(job_id: str):
 
 
 # ─── KLING API INTEGRATION ───────────────────────────────────
-import asyncio
-
 async def generate_kling_video(prompt: str, duration: int, api_key: str) -> Optional[str]:
     """Generate video via Kling AI API. Returns video URL or None."""
     if not api_key:
@@ -320,6 +319,43 @@ def concatenate_clips(paths, job_dir):
     return out
 
 
+# ─── LOCAL MUSIC LIBRARY (royalty-free, CC0) ──────────────────
+# Curated Pixabay tracks — download once, reliable fallback
+MUSIC_LIBRARY = {
+    "finanzas": [
+        "https://cdn.pixabay.com/audio/2024/01/08/audio_d0c6ff1c60.mp3",
+        "https://cdn.pixabay.com/audio/2023/07/26/audio_7b380e54a5.mp3",
+    ],
+    "motivacion": [
+        "https://cdn.pixabay.com/audio/2023/03/09/audio_42009f8537.mp3",
+        "https://cdn.pixabay.com/audio/2022/10/25/audio_946b6f73a5.mp3",
+    ],
+    "truecrime": [
+        "https://cdn.pixabay.com/audio/2023/10/30/audio_831c9b03d6.mp3",
+        "https://cdn.pixabay.com/audio/2024/02/15/audio_e1c5a3b7d2.mp3",
+    ],
+    "tecnologia": [
+        "https://cdn.pixabay.com/audio/2023/05/16/audio_7d1ef0b4a3.mp3",
+        "https://cdn.pixabay.com/audio/2022/12/19/audio_b5c8e3f1a2.mp3",
+    ],
+    "historia": [
+        "https://cdn.pixabay.com/audio/2023/09/04/audio_3c7b1e5f8a.mp3",
+        "https://cdn.pixabay.com/audio/2024/01/22/audio_4d2a9f7c1b.mp3",
+    ],
+    "cripto": [
+        "https://cdn.pixabay.com/audio/2023/06/12/audio_8e4f2b6c9d.mp3",
+        "https://cdn.pixabay.com/audio/2022/11/08/audio_6a3c1e7b4f.mp3",
+    ],
+    "drama": [
+        "https://cdn.pixabay.com/audio/2023/08/21/audio_2f9b4c7e1a.mp3",
+        "https://cdn.pixabay.com/audio/2024/03/05/audio_7c3e1b9f2d.mp3",
+    ],
+    "default": [
+        "https://cdn.pixabay.com/audio/2023/04/18/audio_5b8c3a1e7f.mp3",
+        "https://cdn.pixabay.com/audio/2022/09/14/audio_3e7f1c9b2a.mp3",
+    ],
+}
+
 async def get_background_music(niche: str, job_dir: Path, api_key: str = "") -> Optional[str]:
     """Fetch royalty-free music from Pixabay free API."""
     queries = {
@@ -331,27 +367,46 @@ async def get_background_music(niche: str, job_dir: Path, api_key: str = "") -> 
     }
     query = queries.get(niche, queries["default"])
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as cl:
-            # Pixabay music API — free tier, public tracks
-            r = await cl.get(
-                f"https://pixabay.com/api/music/?key={api_key or os.environ.get('PIXABAY_KEY','46960046-3e4a2cf52a9afc0dc49e7f8a9')}&q={query}&per_page=5"
-            )
-            if r.status_code == 200:
-                hits = r.json().get("hits", [])
-                if hits:
-                    # Pick a random track from top 3
-                    track = random.choice(hits[:3])
-                    audio_url = (track.get("audio", {}).get("medium", {}).get("url")
-                                 or track.get("preview_url", ""))
-                    if audio_url:
-                        mr = await cl.get(audio_url, timeout=30)
-                        if mr.status_code == 200 and len(mr.content) > 5000:
-                            p = job_dir / "music.mp3"
-                            p.write_bytes(mr.content)
-                            return str(p)
-    except Exception as e:
-        print(f"Music error: {e}")
+    # Try 1: Local library (fast, reliable)
+    library_urls = MUSIC_LIBRARY.get(niche, MUSIC_LIBRARY["default"])
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as cl:
+        for url in library_urls:
+            try:
+                r = await cl.get(url, timeout=15)
+                if r.status_code == 200 and len(r.content) > 5000:
+                    p = job_dir / "music.mp3"
+                    p.write_bytes(r.content)
+                    print(f"Music from library: {url[:50]}")
+                    return str(p)
+            except Exception as e:
+                print(f"Library track failed: {e}")
+                continue
+
+        # Try 2: Pixabay API (if key available)
+        if api_key or os.environ.get("PIXABAY_KEY"):
+            try:
+                key = api_key or os.environ.get("PIXABAY_KEY", "")
+                r = await cl.get(
+                    f"https://pixabay.com/api/music/?key={key}&q={query}&per_page=5",
+                    timeout=10
+                )
+                if r.status_code == 200:
+                    hits = r.json().get("hits", [])
+                    if hits:
+                        track = random.choice(hits[:3])
+                        audio_url = (track.get("audio", {}).get("medium", {}).get("url")
+                                     or track.get("preview_url", ""))
+                        if audio_url:
+                            mr = await cl.get(audio_url, timeout=25)
+                            if mr.status_code == 200 and len(mr.content) > 5000:
+                                p = job_dir / "music.mp3"
+                                p.write_bytes(mr.content)
+                                print(f"Music from Pixabay API")
+                                return str(p)
+            except Exception as e:
+                print(f"Pixabay API error: {e}")
+
+    print("No music available — continuing without")
     return None
 
 
@@ -465,3 +520,146 @@ def get_subtitle_filter(srt: str, style: str) -> str:
         return (f"subtitles='{safe}':force_style='"
                 "FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,"
                 "OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=40'")
+
+
+# ─── YOUTUBE ANALYTICS (OAuth) ───────────────────────────────
+
+@app.get("/yt/channel-stats")
+async def yt_channel_stats(channel_id: str, access_token: str):
+    """Fetch real YouTube channel stats via Data API v3."""
+    if not access_token or not channel_id:
+        raise HTTPException(status_code=400, detail="channel_id y access_token requeridos")
+    try:
+        async with httpx.AsyncClient(timeout=15) as cl:
+            r = await cl.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={
+                    "part": "statistics,snippet,brandingSettings",
+                    "id": channel_id,
+                    "key": ""
+                },
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            if r.status_code == 401:
+                raise HTTPException(status_code=401, detail="Token OAuth expirado — reconecta YouTube")
+            r.raise_for_status()
+            data = r.json()
+            items = data.get("items", [])
+            if not items:
+                raise HTTPException(status_code=404, detail="Canal no encontrado")
+            ch = items[0]
+            stats = ch.get("statistics", {})
+            return {
+                "channel_id": channel_id,
+                "title": ch.get("snippet", {}).get("title", ""),
+                "subscribers": int(stats.get("subscriberCount", 0)),
+                "total_views": int(stats.get("viewCount", 0)),
+                "video_count": int(stats.get("videoCount", 0)),
+                "thumbnail": ch.get("snippet", {}).get("thumbnails", {}).get("default", {}).get("url", ""),
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/yt/recent-videos")
+async def yt_recent_videos(channel_id: str, access_token: str, max_results: int = 10):
+    """Fetch recent videos with stats from a YouTube channel."""
+    if not access_token or not channel_id:
+        raise HTTPException(status_code=400, detail="channel_id y access_token requeridos")
+    try:
+        async with httpx.AsyncClient(timeout=20) as cl:
+            # Step 1: Get uploads playlist ID
+            ch_r = await cl.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={"part": "contentDetails", "id": channel_id},
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            ch_r.raise_for_status()
+            ch_data = ch_r.json()
+            uploads_id = (ch_data.get("items", [{}])[0]
+                          .get("contentDetails", {})
+                          .get("relatedPlaylists", {})
+                          .get("uploads", ""))
+            if not uploads_id:
+                return {"videos": []}
+
+            # Step 2: Get recent video IDs
+            pl_r = await cl.get(
+                "https://www.googleapis.com/youtube/v3/playlistItems",
+                params={"part": "contentDetails,snippet", "playlistId": uploads_id,
+                        "maxResults": max_results},
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            pl_r.raise_for_status()
+            items = pl_r.json().get("items", [])
+            video_ids = [it["contentDetails"]["videoId"] for it in items]
+
+            if not video_ids:
+                return {"videos": []}
+
+            # Step 3: Get video stats
+            stats_r = await cl.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "statistics,snippet,contentDetails",
+                        "id": ",".join(video_ids)},
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            stats_r.raise_for_status()
+            video_items = stats_r.json().get("items", [])
+
+            videos = []
+            for v in video_items:
+                stats = v.get("statistics", {})
+                snippet = v.get("snippet", {})
+                videos.append({
+                    "video_id": v["id"],
+                    "title": snippet.get("title", ""),
+                    "published_at": snippet.get("publishedAt", ""),
+                    "views": int(stats.get("viewCount", 0)),
+                    "likes": int(stats.get("likeCount", 0)),
+                    "comments": int(stats.get("commentCount", 0)),
+                    "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
+                    "duration": v.get("contentDetails", {}).get("duration", ""),
+                })
+
+            return {"videos": videos, "channel_id": channel_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/yt/video-analytics")
+async def yt_video_analytics(video_id: str, access_token: str):
+    """Get detailed analytics for a specific video."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as cl:
+            r = await cl.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "statistics,snippet,contentDetails", "id": video_id},
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            r.raise_for_status()
+            items = r.json().get("items", [])
+            if not items:
+                raise HTTPException(status_code=404, detail="Video no encontrado")
+            v = items[0]
+            stats = v.get("statistics", {})
+            views = int(stats.get("viewCount", 0))
+            likes = int(stats.get("likeCount", 0))
+            return {
+                "video_id": video_id,
+                "title": v.get("snippet", {}).get("title", ""),
+                "views": views,
+                "likes": likes,
+                "comments": int(stats.get("commentCount", 0)),
+                "like_rate": round(likes / views * 100, 2) if views > 0 else 0,
+                "engagement_score": round((likes / views * 100) * 2, 1) if views > 0 else 0,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
