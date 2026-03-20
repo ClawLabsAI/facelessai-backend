@@ -40,6 +40,8 @@ class VideoRequest(BaseModel):
     add_music: bool = True
     music_volume: float = 0.08
     zoom_effect: bool = True
+    pixabay_key: str = ""  # Optional: pass from frontend settings
+    kling_key: str = ""  # Optional: Kling API key for AI-generated clips
 
 class StatusResponse(BaseModel):
     job_id: str
@@ -103,6 +105,49 @@ async def get_thumbnail(job_id: str):
 
 # ─── CORE PROCESSING ─────────────────────────────────────────
 
+
+# ─── KLING API INTEGRATION ───────────────────────────────────
+import asyncio
+
+async def generate_kling_video(prompt: str, duration: int, api_key: str) -> Optional[str]:
+    """Generate video via Kling AI API. Returns video URL or None."""
+    if not api_key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=120) as cl:
+            # Step 1: Create task
+            r = await cl.post(
+                "https://api.klingai.com/v1/videos/text2video",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"prompt": prompt, "model": "kling-v1", "duration": min(duration, 10),
+                      "aspect_ratio": "9:16", "mode": "std"}
+            )
+            if r.status_code != 200:
+                print(f"Kling task error: {r.text[:200]}")
+                return None
+            task_id = r.json().get("data", {}).get("task_id")
+            if not task_id:
+                return None
+
+            # Step 2: Poll for result (max 120s)
+            for _ in range(40):
+                await asyncio.sleep(3)
+                sr = await cl.get(
+                    f"https://api.klingai.com/v1/videos/text2video/{task_id}",
+                    headers={"Authorization": f"Bearer {api_key}"}
+                )
+                data = sr.json().get("data", {})
+                status = data.get("task_status", "")
+                if status == "succeed":
+                    videos = data.get("task_result", {}).get("videos", [])
+                    return videos[0].get("url") if videos else None
+                if status in ("failed", "error"):
+                    print(f"Kling task failed: {data}")
+                    return None
+    except Exception as e:
+        print(f"Kling API error: {e}")
+    return None
+
 async def process_video(job_id: str, req: VideoRequest):
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(exist_ok=True)
@@ -127,12 +172,31 @@ async def process_video(job_id: str, req: VideoRequest):
         duration = get_audio_duration(str(audio_path))
         upd("processing", 12, f"Audio OK — {duration:.1f}s")
 
-        # STEP 2: Download clips
-        upd("processing", 15, "Descargando clips de Pexels...")
-        clip_paths = await download_clips(req.pexels_clips[:6], job_dir, upd)
+        # STEP 2: Get clips (Kling AI or Pexels fallback)
+        clip_paths = []
+        if req.kling_key and req.script:
+            upd("processing", 15, "Generando clips con Kling AI...")
+            # Generate 3-4 clips from script sentences
+            sentences = [s.strip() for s in req.script.split('.') if len(s.strip()) > 20][:4]
+            kling_duration = max(3, int(get_audio_duration(str(audio_path)) / max(len(sentences), 1)))
+            for i, sentence in enumerate(sentences):
+                upd("processing", 15 + i*5, f"Generando clip Kling {i+1}/{len(sentences)}...")
+                kling_url = await generate_kling_video(sentence[:200], kling_duration, req.kling_key)
+                if kling_url:
+                    async with httpx.AsyncClient(timeout=60) as cl:
+                        r = await cl.get(kling_url)
+                        if r.status_code == 200 and len(r.content) > 1000:
+                            p = job_dir / f"clip_{i}.mp4"
+                            p.write_bytes(r.content)
+                            clip_paths.append(str(p))
+            upd("processing", 37, f"{len(clip_paths)} clips Kling generados")
+
         if not clip_paths:
-            raise ValueError("No se pudieron descargar clips")
-        upd("processing", 40, f"{len(clip_paths)} clips descargados")
+            upd("processing", 15, "Descargando clips de Pexels...")
+            clip_paths = await download_clips(req.pexels_clips[:6], job_dir, upd)
+            if not clip_paths:
+                raise ValueError("No se pudieron descargar clips. Verifica URLs o configura Kling API.")
+            upd("processing", 40, f"{len(clip_paths)} clips Pexels descargados")
 
         # STEP 3: Process clips with zoom variants
         upd("processing", 42, "Procesando clips con zoom dinamico...")
@@ -149,7 +213,7 @@ async def process_video(job_id: str, req: VideoRequest):
         music_path = None
         if req.add_music:
             upd("processing", 63, "Buscando musica de fondo...")
-            music_path = await get_background_music(req.niche, job_dir)
+            music_path = await get_background_music(req.niche, job_dir, req.pixabay_key)
             upd("processing", 68, "Musica lista" if music_path else "Sin musica disponible")
 
         # STEP 6: SRT subtitles
@@ -256,7 +320,7 @@ def concatenate_clips(paths, job_dir):
     return out
 
 
-async def get_background_music(niche: str, job_dir: Path) -> Optional[str]:
+async def get_background_music(niche: str, job_dir: Path, api_key: str = "") -> Optional[str]:
     """Fetch royalty-free music from Pixabay free API."""
     queries = {
         "finanzas": "corporate+background", "motivacion": "motivational+upbeat",
@@ -271,7 +335,7 @@ async def get_background_music(niche: str, job_dir: Path) -> Optional[str]:
         async with httpx.AsyncClient(timeout=20) as cl:
             # Pixabay music API — free tier, public tracks
             r = await cl.get(
-                f"https://pixabay.com/api/music/?key=46960046-3e4a2cf52a9afc0dc49e7f8a9&q={query}&per_page=5"
+                f"https://pixabay.com/api/music/?key={api_key or os.environ.get('PIXABAY_KEY','46960046-3e4a2cf52a9afc0dc49e7f8a9')}&q={query}&per_page=5"
             )
             if r.status_code == 200:
                 hits = r.json().get("hits", [])
