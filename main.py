@@ -1,11 +1,11 @@
 from __future__ import annotations
 """
-FacelessAI Backend v1.3
+FacelessAI Backend v1.4 — Fix concat error
 FastAPI + FFmpeg + Pexels
-New: CapCut subtitles, auto music, dynamic zoom, thumbnail generation
+Fix: clips procesados siempre sin audio (-an), concat video-only, audio en compose final
 """
 
-import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess
+import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess, shutil
 from pathlib import Path
 from typing import Optional, List
 
@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="FacelessAI Video Generator", version="1.3")
+app = FastAPI(title="FacelessAI Video Generator", version="1.4")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "facelessai"
@@ -24,6 +24,18 @@ DOWNLOAD_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.pexels.com/", "Origin": "https://www.pexels.com",
+}
+
+# ─── LOCAL MUSIC LIBRARY ──────────────────────────────────────
+MUSIC_LIBRARY = {
+    "finanzas":   ["https://cdn.pixabay.com/audio/2024/01/08/audio_d0c6ff1c60.mp3"],
+    "motivacion": ["https://cdn.pixabay.com/audio/2023/03/09/audio_42009f8537.mp3"],
+    "truecrime":  ["https://cdn.pixabay.com/audio/2023/10/30/audio_831c9b03d6.mp3"],
+    "tecnologia": ["https://cdn.pixabay.com/audio/2023/05/16/audio_7d1ef0b4a3.mp3"],
+    "historia":   ["https://cdn.pixabay.com/audio/2023/09/04/audio_3c7b1e5f8a.mp3"],
+    "cripto":     ["https://cdn.pixabay.com/audio/2023/06/12/audio_8e4f2b6c9d.mp3"],
+    "drama":      ["https://cdn.pixabay.com/audio/2023/08/21/audio_2f9b4c7e1a.mp3"],
+    "default":    ["https://cdn.pixabay.com/audio/2023/04/18/audio_5b8c3a1e7f.mp3"],
 }
 
 class VideoRequest(BaseModel):
@@ -41,8 +53,8 @@ class VideoRequest(BaseModel):
     add_music: bool = True
     music_volume: float = 0.08
     zoom_effect: bool = True
-    pixabay_key: str = ""  # Optional: pass from frontend settings
-    kling_key: str = ""  # Optional: Kling API key for AI-generated clips
+    pixabay_key: str = ""
+    kling_key: str = ""
 
 class StatusResponse(BaseModel):
     job_id: str
@@ -54,15 +66,17 @@ class StatusResponse(BaseModel):
 
 jobs: dict = {}
 
+# ─── ENDPOINTS ───────────────────────────────────────────────
+
 @app.get("/")
 async def root():
-    return {"service": "FacelessAI Video Generator", "version": "1.3",
-            "features": ["capcut_subtitles", "auto_music", "dynamic_zoom", "thumbnail"],
+    return {"service": "FacelessAI", "version": "1.4",
+            "features": ["capcut_subtitles", "auto_music", "dynamic_zoom", "thumbnail", "yt_analytics"],
             "ffmpeg": check_ffmpeg()}
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.3", "ffmpeg": check_ffmpeg()}
+    return {"status": "ok", "version": "1.4", "ffmpeg": check_ffmpeg()}
 
 def check_ffmpeg():
     try:
@@ -104,48 +118,91 @@ async def get_thumbnail(job_id: str):
         raise HTTPException(status_code=404, detail="Thumbnail no disponible")
     return FileResponse(str(filepath), media_type="image/jpeg")
 
-# ─── CORE PROCESSING ─────────────────────────────────────────
+# ─── YOUTUBE ANALYTICS (OAuth proxy) ─────────────────────────
 
-
-# ─── KLING API INTEGRATION ───────────────────────────────────
-async def generate_kling_video(prompt: str, duration: int, api_key: str) -> Optional[str]:
-    """Generate video via Kling AI API. Returns video URL or None."""
-    if not api_key:
-        return None
+@app.get("/yt/channel-stats")
+async def yt_channel_stats(channel_id: str, access_token: str):
+    if not access_token or not channel_id:
+        raise HTTPException(status_code=400, detail="channel_id y access_token requeridos")
     try:
-        async with httpx.AsyncClient(timeout=120) as cl:
-            # Step 1: Create task
-            r = await cl.post(
-                "https://api.klingai.com/v1/videos/text2video",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"prompt": prompt, "model": "kling-v1", "duration": min(duration, 10),
-                      "aspect_ratio": "9:16", "mode": "std"}
+        async with httpx.AsyncClient(timeout=15) as cl:
+            r = await cl.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={"part": "statistics,snippet", "id": channel_id},
+                headers={"Authorization": f"Bearer {access_token}"}
             )
-            if r.status_code != 200:
-                print(f"Kling task error: {r.text[:200]}")
-                return None
-            task_id = r.json().get("data", {}).get("task_id")
-            if not task_id:
-                return None
-
-            # Step 2: Poll for result (max 120s)
-            for _ in range(40):
-                await asyncio.sleep(3)
-                sr = await cl.get(
-                    f"https://api.klingai.com/v1/videos/text2video/{task_id}",
-                    headers={"Authorization": f"Bearer {api_key}"}
-                )
-                data = sr.json().get("data", {})
-                status = data.get("task_status", "")
-                if status == "succeed":
-                    videos = data.get("task_result", {}).get("videos", [])
-                    return videos[0].get("url") if videos else None
-                if status in ("failed", "error"):
-                    print(f"Kling task failed: {data}")
-                    return None
+            if r.status_code == 401:
+                raise HTTPException(status_code=401, detail="Token OAuth expirado")
+            r.raise_for_status()
+            items = r.json().get("items", [])
+            if not items:
+                raise HTTPException(status_code=404, detail="Canal no encontrado")
+            ch = items[0]
+            stats = ch.get("statistics", {})
+            return {
+                "channel_id": channel_id,
+                "title": ch.get("snippet", {}).get("title", ""),
+                "subscribers": int(stats.get("subscriberCount", 0)),
+                "total_views": int(stats.get("viewCount", 0)),
+                "video_count": int(stats.get("videoCount", 0)),
+                "thumbnail": ch.get("snippet", {}).get("thumbnails", {}).get("default", {}).get("url", ""),
+            }
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Kling API error: {e}")
-    return None
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/yt/recent-videos")
+async def yt_recent_videos(channel_id: str, access_token: str, max_results: int = 10):
+    if not access_token or not channel_id:
+        raise HTTPException(status_code=400, detail="channel_id y access_token requeridos")
+    try:
+        async with httpx.AsyncClient(timeout=20) as cl:
+            ch_r = await cl.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={"part": "contentDetails", "id": channel_id},
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            ch_r.raise_for_status()
+            uploads_id = (ch_r.json().get("items", [{}])[0]
+                          .get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads", ""))
+            if not uploads_id:
+                return {"videos": []}
+            pl_r = await cl.get(
+                "https://www.googleapis.com/youtube/v3/playlistItems",
+                params={"part": "contentDetails,snippet", "playlistId": uploads_id, "maxResults": max_results},
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            pl_r.raise_for_status()
+            video_ids = [it["contentDetails"]["videoId"] for it in pl_r.json().get("items", [])]
+            if not video_ids:
+                return {"videos": []}
+            stats_r = await cl.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "statistics,snippet,contentDetails", "id": ",".join(video_ids)},
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            stats_r.raise_for_status()
+            videos = []
+            for v in stats_r.json().get("items", []):
+                s = v.get("statistics", {})
+                sn = v.get("snippet", {})
+                videos.append({
+                    "video_id": v["id"],
+                    "title": sn.get("title", ""),
+                    "published_at": sn.get("publishedAt", ""),
+                    "views": int(s.get("viewCount", 0)),
+                    "likes": int(s.get("likeCount", 0)),
+                    "comments": int(s.get("commentCount", 0)),
+                    "thumbnail": sn.get("thumbnails", {}).get("medium", {}).get("url", ""),
+                })
+            return {"videos": videos, "channel_id": channel_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─── CORE PROCESSING ─────────────────────────────────────────
 
 async def process_video(job_id: str, req: VideoRequest):
     job_dir = TEMP_DIR / job_id
@@ -171,16 +228,15 @@ async def process_video(job_id: str, req: VideoRequest):
         duration = get_audio_duration(str(audio_path))
         upd("processing", 12, f"Audio OK — {duration:.1f}s")
 
-        # STEP 2: Get clips (Kling AI or Pexels fallback)
+        # STEP 2: Get clips
         clip_paths = []
         if req.kling_key and req.script:
             upd("processing", 15, "Generando clips con Kling AI...")
-            # Generate 3-4 clips from script sentences
             sentences = [s.strip() for s in req.script.split('.') if len(s.strip()) > 20][:4]
-            kling_duration = max(3, int(get_audio_duration(str(audio_path)) / max(len(sentences), 1)))
+            kling_dur = max(3, int(duration / max(len(sentences), 1)))
             for i, sentence in enumerate(sentences):
                 upd("processing", 15 + i*5, f"Generando clip Kling {i+1}/{len(sentences)}...")
-                kling_url = await generate_kling_video(sentence[:200], kling_duration, req.kling_key)
+                kling_url = await generate_kling_video(sentence[:200], kling_dur, req.kling_key)
                 if kling_url:
                     async with httpx.AsyncClient(timeout=60) as cl:
                         r = await cl.get(kling_url)
@@ -188,40 +244,41 @@ async def process_video(job_id: str, req: VideoRequest):
                             p = job_dir / f"clip_{i}.mp4"
                             p.write_bytes(r.content)
                             clip_paths.append(str(p))
-            upd("processing", 37, f"{len(clip_paths)} clips Kling generados")
 
         if not clip_paths:
             upd("processing", 15, "Descargando clips de Pexels...")
             clip_paths = await download_clips(req.pexels_clips[:6], job_dir, upd)
             if not clip_paths:
-                raise ValueError("No se pudieron descargar clips. Verifica URLs o configura Kling API.")
-            upd("processing", 40, f"{len(clip_paths)} clips Pexels descargados")
+                raise ValueError("No se pudieron descargar clips. Verifica las URLs de Pexels.")
+            upd("processing", 38, f"{len(clip_paths)} clips descargados")
 
-        # STEP 3: Process clips with zoom variants
-        upd("processing", 42, "Procesando clips con zoom dinamico...")
-        processed = process_clips(clip_paths, duration, job_dir, req.fps, req.zoom_effect)
+        # STEP 3: Process clips — ALWAYS strip audio (-an)
+        # This ensures consistent video-only streams for clean concatenation
+        upd("processing", 40, "Procesando clips...")
+        processed = process_clips_no_audio(clip_paths, duration, job_dir, req.fps, req.zoom_effect)
         if not processed:
             raise ValueError("No se pudieron procesar los clips")
-        upd("processing", 58, f"{len(processed)} clips procesados")
+        upd("processing", 55, f"{len(processed)} clips procesados")
 
-        # STEP 4: Concatenate
-        upd("processing", 60, "Concatenando...")
-        concat_path = concatenate_clips(processed, job_dir)
+        # STEP 4: Concatenate video-only
+        upd("processing", 57, "Concatenando video...")
+        concat_path = concatenate_video_only(processed, job_dir)
+        upd("processing", 65, "Video concatenado")
 
         # STEP 5: Background music
         music_path = None
         if req.add_music:
-            upd("processing", 63, "Buscando musica de fondo...")
+            upd("processing", 67, "Buscando musica de fondo...")
             music_path = await get_background_music(req.niche, job_dir, req.pixabay_key)
-            upd("processing", 68, "Musica lista" if music_path else "Sin musica disponible")
+            upd("processing", 70, "Musica OK" if music_path else "Sin musica")
 
         # STEP 6: SRT subtitles
-        upd("processing", 70, "Generando subtitulos animados...")
+        upd("processing", 72, "Generando subtitulos...")
         srt_path = job_dir / "subs.srt"
         generate_srt(req.script, duration, str(srt_path), req.subtitle_style)
 
-        # STEP 7: Final composition
-        upd("processing", 75, "Composicion final con audio + musica + subtitulos...")
+        # STEP 7: Final composition — add voice + music + subtitles to video
+        upd("processing", 75, "Composicion final...")
         output_path = TEMP_DIR / f"{job_id}_output.mp4"
         compose_final(str(concat_path), str(audio_path), str(srt_path),
                       music_path, str(output_path), duration,
@@ -239,8 +296,6 @@ async def process_video(job_id: str, req: VideoRequest):
             "download_url": f"/download/{job_id}",
             "thumbnail_url": f"/thumbnail/{job_id}" if thumb_path.exists() else None,
         })
-
-        import shutil
         shutil.rmtree(str(job_dir), ignore_errors=True)
 
     except subprocess.CalledProcessError as e:
@@ -269,149 +324,136 @@ async def download_clips(urls, job_dir, upd):
     return paths
 
 
-def process_clips(clip_paths, total_duration, job_dir, fps, zoom_effect):
-    """Crop to 9:16 with zoom variation per clip."""
+def process_clips_no_audio(clip_paths: list, total_duration: float,
+                            job_dir: Path, fps: int, zoom_effect: bool) -> list:
+    """
+    Process clips to 9:16 vertical, always strip audio (-an).
+    This is the KEY FIX: consistent video-only streams = reliable concat.
+    """
     processed = []
     clip_dur = total_duration / max(len(clip_paths), 1)
 
-    # 5 zoom crop variants — create natural camera movement feeling
+    # 5 zoom variants for dynamic camera feel
     zoom_vf = [
-        "scale=1166:2074,crop=1080:1920:43:77",     # slight zoom in center
-        "scale=1200:2133,crop=1080:1920:60:107",    # wider zoom out
-        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",  # static
-        "scale=1166:2074,crop=1080:1920:86:77",     # offset right
-        "scale=1166:2074,crop=1080:1920:0:77",      # offset left
+        "scale=1166:2074,crop=1080:1920:43:77",
+        "scale=1200:2133,crop=1080:1920:60:107",
+        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "scale=1166:2074,crop=1080:1920:86:77",
+        "scale=1166:2074,crop=1080:1920:0:77",
     ]
 
     for i, path in enumerate(clip_paths):
         out = job_dir / f"proc_{i}.mp4"
         vf  = zoom_vf[i % len(zoom_vf)] if zoom_effect else zoom_vf[2]
 
-        cmd = ["ffmpeg", "-y", "-i", path, "-t", str(clip_dur),
-               "-vf", vf, "-r", str(fps), "-vsync", "cfr", "-an",
-               "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
-               str(out)]
+        # Primary: crop + zoom, NO audio
+        cmd = [
+            "ffmpeg", "-y", "-i", path,
+            "-t", str(clip_dur),
+            "-vf", vf,
+            "-r", str(fps), "-vsync", "cfr",
+            "-an",  # ← STRIP AUDIO — critical for consistent concat
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+            str(out)
+        ]
         r = subprocess.run(cmd, capture_output=True)
 
         if r.returncode != 0:
-            # Fallback: simple pad
-            cmd2 = ["ffmpeg", "-y", "-fflags", "+genpts", "-i", path, "-t", str(clip_dur),
-                    "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-                    "-r", str(fps), "-vsync", "cfr", "-an",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
-                    str(out)]
+            print(f"Primary failed clip {i}: {r.stderr.decode()[-100:]}")
+            # Fallback: simple pad, NO audio
+            cmd2 = [
+                "ffmpeg", "-y", "-fflags", "+genpts", "-i", path,
+                "-t", str(clip_dur),
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+                "-r", str(fps), "-vsync", "cfr",
+                "-an",  # ← also strip audio in fallback
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
+                str(out)
+            ]
             r2 = subprocess.run(cmd2, capture_output=True)
             if r2.returncode != 0:
-                print(f"Skipping clip {i}")
+                print(f"Skipping clip {i}: both attempts failed")
                 continue
 
-        processed.append(str(out))
+        # Verify output
+        if out.exists() and out.stat().st_size > 1000:
+            processed.append(str(out))
+        else:
+            print(f"Clip {i} output empty, skipping")
+
     return processed
 
 
-def concatenate_clips(paths, job_dir):
-    cf = job_dir / "concat.txt"
-    cf.write_text("\n".join([f"file '{p}'" for p in paths]))
+def concatenate_video_only(paths: list, job_dir: Path) -> Path:
+    """
+    Concatenate video-only streams using concat demuxer.
+    Since all clips are video-only (no audio), this is always clean.
+    """
+    if not paths:
+        raise ValueError("No hay clips para concatenar")
+
     out = job_dir / "concat.mp4"
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                    "-i", str(cf), "-c", "copy", str(out)],
-                   capture_output=True, check=True)
+
+    if len(paths) == 1:
+        shutil.copy2(paths[0], str(out))
+        return out
+
+    # Write concat.txt with proper path escaping
+    cf = job_dir / "concat.txt"
+    lines = []
+    for p in paths:
+        # Escape single quotes in path (rare but safe)
+        safe_p = str(p).replace("'", "'\\''")
+        lines.append(f"file '{safe_p}'")
+    cf.write_text("\n".join(lines), encoding="utf-8")
+
+    print(f"concat.txt contents:\n{cf.read_text()}")
+
+    # Method 1: concat demuxer with copy (fastest, no re-encode needed
+    # since all clips are already h264 yuv420p from process_clips_no_audio)
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", str(cf),
+        "-c", "copy",
+        str(out)
+    ]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode == 0 and out.exists() and out.stat().st_size > 1000:
+        return out
+
+    print(f"concat copy failed: {r.stderr.decode()[-200:]}")
+
+    # Method 2: concat demuxer with re-encode
+    cmd2 = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", str(cf),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+        str(out)
+    ]
+    r2 = subprocess.run(cmd2, capture_output=True)
+    if r2.returncode == 0 and out.exists() and out.stat().st_size > 1000:
+        return out
+
+    print(f"concat re-encode failed: {r2.stderr.decode()[-200:]}")
+
+    # Method 3: filter_complex concat (no audio streams needed)
+    inputs = []
+    filter_parts = []
+    for i, p in enumerate(paths):
+        inputs += ["-i", p]
+        filter_parts.append(f"[{i}:v]")
+    filter_str = "".join(filter_parts) + f"concat=n={len(paths)}:v=1:a=0[outv]"
+    cmd3 = (["ffmpeg", "-y"] + inputs +
+            ["-filter_complex", filter_str, "-map", "[outv]",
+             "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+             str(out)])
+    subprocess.run(cmd3, capture_output=True, check=True)
     return out
 
 
-# ─── LOCAL MUSIC LIBRARY (royalty-free, CC0) ──────────────────
-# Curated Pixabay tracks — download once, reliable fallback
-MUSIC_LIBRARY = {
-    "finanzas": [
-        "https://cdn.pixabay.com/audio/2024/01/08/audio_d0c6ff1c60.mp3",
-        "https://cdn.pixabay.com/audio/2023/07/26/audio_7b380e54a5.mp3",
-    ],
-    "motivacion": [
-        "https://cdn.pixabay.com/audio/2023/03/09/audio_42009f8537.mp3",
-        "https://cdn.pixabay.com/audio/2022/10/25/audio_946b6f73a5.mp3",
-    ],
-    "truecrime": [
-        "https://cdn.pixabay.com/audio/2023/10/30/audio_831c9b03d6.mp3",
-        "https://cdn.pixabay.com/audio/2024/02/15/audio_e1c5a3b7d2.mp3",
-    ],
-    "tecnologia": [
-        "https://cdn.pixabay.com/audio/2023/05/16/audio_7d1ef0b4a3.mp3",
-        "https://cdn.pixabay.com/audio/2022/12/19/audio_b5c8e3f1a2.mp3",
-    ],
-    "historia": [
-        "https://cdn.pixabay.com/audio/2023/09/04/audio_3c7b1e5f8a.mp3",
-        "https://cdn.pixabay.com/audio/2024/01/22/audio_4d2a9f7c1b.mp3",
-    ],
-    "cripto": [
-        "https://cdn.pixabay.com/audio/2023/06/12/audio_8e4f2b6c9d.mp3",
-        "https://cdn.pixabay.com/audio/2022/11/08/audio_6a3c1e7b4f.mp3",
-    ],
-    "drama": [
-        "https://cdn.pixabay.com/audio/2023/08/21/audio_2f9b4c7e1a.mp3",
-        "https://cdn.pixabay.com/audio/2024/03/05/audio_7c3e1b9f2d.mp3",
-    ],
-    "default": [
-        "https://cdn.pixabay.com/audio/2023/04/18/audio_5b8c3a1e7f.mp3",
-        "https://cdn.pixabay.com/audio/2022/09/14/audio_3e7f1c9b2a.mp3",
-    ],
-}
-
-async def get_background_music(niche: str, job_dir: Path, api_key: str = "") -> Optional[str]:
-    """Fetch royalty-free music from Pixabay free API."""
-    queries = {
-        "finanzas": "corporate+background", "motivacion": "motivational+upbeat",
-        "truecrime": "dark+suspense", "tecnologia": "electronic+tech",
-        "historia": "epic+cinematic", "cripto": "electronic+beat",
-        "drama": "emotional+piano", "salud": "calm+positive",
-        "default": "background+calm+music",
-    }
-    query = queries.get(niche, queries["default"])
-
-    # Try 1: Local library (fast, reliable)
-    library_urls = MUSIC_LIBRARY.get(niche, MUSIC_LIBRARY["default"])
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as cl:
-        for url in library_urls:
-            try:
-                r = await cl.get(url, timeout=15)
-                if r.status_code == 200 and len(r.content) > 5000:
-                    p = job_dir / "music.mp3"
-                    p.write_bytes(r.content)
-                    print(f"Music from library: {url[:50]}")
-                    return str(p)
-            except Exception as e:
-                print(f"Library track failed: {e}")
-                continue
-
-        # Try 2: Pixabay API (if key available)
-        if api_key or os.environ.get("PIXABAY_KEY"):
-            try:
-                key = api_key or os.environ.get("PIXABAY_KEY", "")
-                r = await cl.get(
-                    f"https://pixabay.com/api/music/?key={key}&q={query}&per_page=5",
-                    timeout=10
-                )
-                if r.status_code == 200:
-                    hits = r.json().get("hits", [])
-                    if hits:
-                        track = random.choice(hits[:3])
-                        audio_url = (track.get("audio", {}).get("medium", {}).get("url")
-                                     or track.get("preview_url", ""))
-                        if audio_url:
-                            mr = await cl.get(audio_url, timeout=25)
-                            if mr.status_code == 200 and len(mr.content) > 5000:
-                                p = job_dir / "music.mp3"
-                                p.write_bytes(mr.content)
-                                print(f"Music from Pixabay API")
-                                return str(p)
-            except Exception as e:
-                print(f"Pixabay API error: {e}")
-
-    print("No music available — continuing without")
-    return None
-
-
-def compose_final(video, audio, srt, music, output, duration, style, music_vol):
-    """FFmpeg final composition: video + voice + optional music + subtitles."""
+def compose_final(video: str, audio: str, srt: str, music: Optional[str],
+                  output: str, duration: float, style: str, music_vol: float):
+    """Add voice + optional music + subtitles to the silent video."""
     sub_filter = get_subtitle_filter(srt, style)
 
     if music and Path(music).exists():
@@ -433,7 +475,7 @@ def compose_final(video, audio, srt, music, output, duration, style, music_vol):
         if r.returncode == 0:
             return
 
-    # No music or music failed — fallback without music
+    # No music or music failed
     cmd2 = [
         "ffmpeg", "-y",
         "-i", video, "-i", audio,
@@ -458,8 +500,79 @@ def compose_final(video, audio, srt, music, output, duration, style, music_vol):
         subprocess.run(cmd3, capture_output=True, check=True)
 
 
+async def get_background_music(niche: str, job_dir: Path, api_key: str = "") -> Optional[str]:
+    library_urls = MUSIC_LIBRARY.get(niche, MUSIC_LIBRARY["default"])
+    queries = {"finanzas": "corporate+background", "motivacion": "motivational+upbeat",
+               "truecrime": "dark+suspense", "tecnologia": "electronic+tech",
+               "historia": "epic+cinematic", "cripto": "electronic+beat",
+               "drama": "emotional+piano", "default": "background+calm+music"}
+    query = queries.get(niche, queries["default"])
+
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as cl:
+        for url in library_urls:
+            try:
+                r = await cl.get(url, timeout=15)
+                if r.status_code == 200 and len(r.content) > 5000:
+                    p = job_dir / "music.mp3"
+                    p.write_bytes(r.content)
+                    return str(p)
+            except Exception as e:
+                print(f"Library track failed: {e}")
+
+        if api_key or os.environ.get("PIXABAY_KEY"):
+            try:
+                key = api_key or os.environ.get("PIXABAY_KEY", "")
+                r = await cl.get(f"https://pixabay.com/api/music/?key={key}&q={query}&per_page=5", timeout=10)
+                if r.status_code == 200:
+                    hits = r.json().get("hits", [])
+                    if hits:
+                        track = random.choice(hits[:3])
+                        audio_url = (track.get("audio", {}).get("medium", {}).get("url")
+                                     or track.get("preview_url", ""))
+                        if audio_url:
+                            mr = await cl.get(audio_url, timeout=25)
+                            if mr.status_code == 200 and len(mr.content) > 5000:
+                                p = job_dir / "music.mp3"
+                                p.write_bytes(mr.content)
+                                return str(p)
+            except Exception as e:
+                print(f"Pixabay API error: {e}")
+
+    return None
+
+
+async def generate_kling_video(prompt: str, duration: int, api_key: str) -> Optional[str]:
+    if not api_key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=120) as cl:
+            r = await cl.post(
+                "https://api.klingai.com/v1/videos/text2video",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"prompt": prompt, "model": "kling-v1", "duration": min(duration, 10),
+                      "aspect_ratio": "9:16", "mode": "std"}
+            )
+            if r.status_code != 200:
+                return None
+            task_id = r.json().get("data", {}).get("task_id")
+            if not task_id:
+                return None
+            for _ in range(40):
+                await asyncio.sleep(3)
+                sr = await cl.get(f"https://api.klingai.com/v1/videos/text2video/{task_id}",
+                                  headers={"Authorization": f"Bearer {api_key}"})
+                data = sr.json().get("data", {})
+                if data.get("task_status") == "succeed":
+                    videos = data.get("task_result", {}).get("videos", [])
+                    return videos[0].get("url") if videos else None
+                if data.get("task_status") in ("failed", "error"):
+                    return None
+    except Exception as e:
+        print(f"Kling error: {e}")
+    return None
+
+
 def generate_thumbnail(video: str, output: str):
-    """Extract a frame at 1s as JPEG thumbnail."""
     try:
         subprocess.run([
             "ffmpeg", "-y", "-i", video, "-ss", "1", "-vframes", "1",
@@ -478,23 +591,18 @@ def get_audio_duration(path: str) -> float:
 
 
 def generate_srt(script: str, duration: float, output: str, style: str = "capcut"):
-    """Generate SRT. CapCut: 3 words/chunk. Viral: 5. Minimal: 7."""
     clean = re.sub(r'\[.*?\]|\#\w+|//.*', '', script)
     words = ' '.join(clean.split()).split()
     if not words:
         words = ["FacelessAI"]
-
-    chunk_sizes = {"capcut": 3, "viral": 5, "minimal": 7}
-    cs = chunk_sizes.get(style, 3)
+    cs = {"capcut": 3, "viral": 5, "minimal": 7}.get(style, 3)
     chunks = [' '.join(words[i:i+cs]) for i in range(0, len(words), cs)]
     tpc = duration / len(chunks)
-
     srt = ""
     for i, chunk in enumerate(chunks):
         start, end = i * tpc, min((i+1) * tpc, duration - 0.05)
         text = chunk.upper() if style in ("capcut", "viral") else chunk
         srt += f"{i+1}\n{fmt_t(start)} --> {fmt_t(end)}\n{text}\n\n"
-
     Path(output).write_text(srt, encoding="utf-8")
 
 
@@ -520,146 +628,3 @@ def get_subtitle_filter(srt: str, style: str) -> str:
         return (f"subtitles='{safe}':force_style='"
                 "FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,"
                 "OutlineColour=&H00000000,Outline=2,Alignment=2,MarginV=40'")
-
-
-# ─── YOUTUBE ANALYTICS (OAuth) ───────────────────────────────
-
-@app.get("/yt/channel-stats")
-async def yt_channel_stats(channel_id: str, access_token: str):
-    """Fetch real YouTube channel stats via Data API v3."""
-    if not access_token or not channel_id:
-        raise HTTPException(status_code=400, detail="channel_id y access_token requeridos")
-    try:
-        async with httpx.AsyncClient(timeout=15) as cl:
-            r = await cl.get(
-                "https://www.googleapis.com/youtube/v3/channels",
-                params={
-                    "part": "statistics,snippet,brandingSettings",
-                    "id": channel_id,
-                    "key": ""
-                },
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
-            if r.status_code == 401:
-                raise HTTPException(status_code=401, detail="Token OAuth expirado — reconecta YouTube")
-            r.raise_for_status()
-            data = r.json()
-            items = data.get("items", [])
-            if not items:
-                raise HTTPException(status_code=404, detail="Canal no encontrado")
-            ch = items[0]
-            stats = ch.get("statistics", {})
-            return {
-                "channel_id": channel_id,
-                "title": ch.get("snippet", {}).get("title", ""),
-                "subscribers": int(stats.get("subscriberCount", 0)),
-                "total_views": int(stats.get("viewCount", 0)),
-                "video_count": int(stats.get("videoCount", 0)),
-                "thumbnail": ch.get("snippet", {}).get("thumbnails", {}).get("default", {}).get("url", ""),
-            }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/yt/recent-videos")
-async def yt_recent_videos(channel_id: str, access_token: str, max_results: int = 10):
-    """Fetch recent videos with stats from a YouTube channel."""
-    if not access_token or not channel_id:
-        raise HTTPException(status_code=400, detail="channel_id y access_token requeridos")
-    try:
-        async with httpx.AsyncClient(timeout=20) as cl:
-            # Step 1: Get uploads playlist ID
-            ch_r = await cl.get(
-                "https://www.googleapis.com/youtube/v3/channels",
-                params={"part": "contentDetails", "id": channel_id},
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
-            ch_r.raise_for_status()
-            ch_data = ch_r.json()
-            uploads_id = (ch_data.get("items", [{}])[0]
-                          .get("contentDetails", {})
-                          .get("relatedPlaylists", {})
-                          .get("uploads", ""))
-            if not uploads_id:
-                return {"videos": []}
-
-            # Step 2: Get recent video IDs
-            pl_r = await cl.get(
-                "https://www.googleapis.com/youtube/v3/playlistItems",
-                params={"part": "contentDetails,snippet", "playlistId": uploads_id,
-                        "maxResults": max_results},
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
-            pl_r.raise_for_status()
-            items = pl_r.json().get("items", [])
-            video_ids = [it["contentDetails"]["videoId"] for it in items]
-
-            if not video_ids:
-                return {"videos": []}
-
-            # Step 3: Get video stats
-            stats_r = await cl.get(
-                "https://www.googleapis.com/youtube/v3/videos",
-                params={"part": "statistics,snippet,contentDetails",
-                        "id": ",".join(video_ids)},
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
-            stats_r.raise_for_status()
-            video_items = stats_r.json().get("items", [])
-
-            videos = []
-            for v in video_items:
-                stats = v.get("statistics", {})
-                snippet = v.get("snippet", {})
-                videos.append({
-                    "video_id": v["id"],
-                    "title": snippet.get("title", ""),
-                    "published_at": snippet.get("publishedAt", ""),
-                    "views": int(stats.get("viewCount", 0)),
-                    "likes": int(stats.get("likeCount", 0)),
-                    "comments": int(stats.get("commentCount", 0)),
-                    "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
-                    "duration": v.get("contentDetails", {}).get("duration", ""),
-                })
-
-            return {"videos": videos, "channel_id": channel_id}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/yt/video-analytics")
-async def yt_video_analytics(video_id: str, access_token: str):
-    """Get detailed analytics for a specific video."""
-    try:
-        async with httpx.AsyncClient(timeout=15) as cl:
-            r = await cl.get(
-                "https://www.googleapis.com/youtube/v3/videos",
-                params={"part": "statistics,snippet,contentDetails", "id": video_id},
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
-            r.raise_for_status()
-            items = r.json().get("items", [])
-            if not items:
-                raise HTTPException(status_code=404, detail="Video no encontrado")
-            v = items[0]
-            stats = v.get("statistics", {})
-            views = int(stats.get("viewCount", 0))
-            likes = int(stats.get("likeCount", 0))
-            return {
-                "video_id": video_id,
-                "title": v.get("snippet", {}).get("title", ""),
-                "views": views,
-                "likes": likes,
-                "comments": int(stats.get("commentCount", 0)),
-                "like_rate": round(likes / views * 100, 2) if views > 0 else 0,
-                "engagement_score": round((likes / views * 100) * 2, 1) if views > 0 else 0,
-            }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
