@@ -12,7 +12,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="FacelessAI", version="1.5")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+
+app = FastAPI(title="FacelessAI", version="1.6")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "facelessai"
@@ -53,11 +56,17 @@ jobs: dict = {}
 
 @app.get("/")
 async def root():
-    return {"service": "FacelessAI", "version": "1.5", "ffmpeg": check_ffmpeg()}
+    return {"service": "FacelessAI", "version": "1.6", "ffmpeg": check_ffmpeg()}
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.5", "ffmpeg": check_ffmpeg()}
+    return {
+        "status": "ok",
+        "version": "1.6",
+        "ffmpeg": check_ffmpeg(),
+        "openai_configured": bool(OPENAI_API_KEY),
+        "pexels_configured": bool(PEXELS_API_KEY),
+    }
 
 def check_ffmpeg():
     try:
@@ -218,6 +227,65 @@ async def yt_recent_videos(channel_id: str, access_token: str, max_results: int 
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ─── TTS PROXY ───────────────────────────────────────────────
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "alloy"
+    model: str = "tts-1"
+    api_key: str = ""   # optional — falls back to OPENAI_API_KEY env var
+
+@app.post("/tts")
+async def tts_proxy(req: TTSRequest):
+    key = req.api_key or OPENAI_API_KEY
+    if not key:
+        raise HTTPException(status_code=400, detail="No OpenAI API key. Set OPENAI_API_KEY env var in Railway or pass api_key in request.")
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+    try:
+        async with httpx.AsyncClient(timeout=60) as cl:
+            r = await cl.post(
+                "https://api.openai.com/v1/audio/speech",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"model": req.model, "input": req.text[:4096], "voice": req.voice}
+            )
+            if r.status_code == 401:
+                raise HTTPException(status_code=401, detail="Invalid OpenAI API key")
+            if r.status_code != 200:
+                raise HTTPException(status_code=r.status_code, detail=f"OpenAI TTS error: {r.text[:200]}")
+        from fastapi.responses import Response
+        return Response(content=r.content, media_type="audio/mpeg",
+                        headers={"Content-Disposition": "attachment; filename=speech.mp3"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── PEXELS PROXY ────────────────────────────────────────────
+
+@app.get("/pexels/search")
+async def pexels_search(query: str, per_page: int = 6, orientation: str = "portrait", api_key: str = ""):
+    key = api_key or PEXELS_API_KEY
+    if not key:
+        raise HTTPException(status_code=400, detail="No Pexels API key. Set PEXELS_API_KEY env var in Railway or pass api_key param.")
+    try:
+        async with httpx.AsyncClient(timeout=20) as cl:
+            r = await cl.get(
+                "https://api.pexels.com/videos/search",
+                params={"query": query, "per_page": min(per_page, 10), "orientation": orientation},
+                headers={"Authorization": key}
+            )
+            if r.status_code == 401:
+                raise HTTPException(status_code=401, detail="Invalid Pexels API key")
+            r.raise_for_status()
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ─── CORE PROCESSING ─────────────────────────────────────────
 

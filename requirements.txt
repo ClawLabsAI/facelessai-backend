@@ -5,4 +5,4 @@ python-multipart>=0.0.6
 pydantic>=2.0.0
 yt-dlp>=2024.1.0
 openai>=1.0.0
-# v1.6 - fix PORT + add yt-dlp/openai
+# v1.7 - add TTS proxy + Pexels proxy endpoints
