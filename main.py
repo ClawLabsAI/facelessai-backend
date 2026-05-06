@@ -1,23 +1,72 @@
 from __future__ import annotations
 """
-FacelessAI Backend v1.9 — Simplified pipeline, full diagnostic logging
+FacelessAI Backend v2.0 — Simplified pipeline, full diagnostic logging
 """
 
-import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess, shutil
+import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess, shutil, time
 from pathlib import Path
 from typing import Optional, List
+from collections import defaultdict
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header, Depends
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from typing import Optional as Opt
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+FAI_SECRET_KEY = os.getenv("FAI_SECRET_KEY", "")   # if empty → auth disabled (dev mode)
 
-app = FastAPI(title="FacelessAI", version="1.9")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="FacelessAI", version="2.0")
+
+ALLOWED_ORIGINS = [
+    "https://clawlabsai.github.io",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+app.add_middleware(CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https?://localhost:\d+",  # any local dev port
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# ─── RATE LIMITER (simple in-memory, per IP) ─────────────────
+_rate_store: dict = defaultdict(list)   # ip → [timestamps]
+
+def _check_rate(ip: str, limit: int, window: int = 60) -> bool:
+    """Returns True if under limit. window in seconds."""
+    now = time.time()
+    times = [t for t in _rate_store[ip] if now - t < window]
+    _rate_store[ip] = times
+    if len(times) >= limit:
+        return False
+    _rate_store[ip].append(now)
+    return True
+
+# ─── AUTH DEPENDENCY ─────────────────────────────────────────
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return forwarded.split(",")[0].strip() if forwarded else request.client.host
+
+def require_key(request: Request, x_fai_key: Opt[str] = Header(None)):
+    """Validates X-FAI-Key header when FAI_SECRET_KEY env var is set."""
+    if FAI_SECRET_KEY and x_fai_key != FAI_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="X-FAI-Key inválida o ausente")
+
+def rate_limit_generate(request: Request):
+    """Max 5 /generate calls per minute per IP."""
+    ip = _get_client_ip(request)
+    if not _check_rate(f"gen:{ip}", limit=5, window=60):
+        raise HTTPException(status_code=429, detail="Rate limit: máximo 5 vídeos/min por IP")
+
+def rate_limit_tts(request: Request):
+    """Max 20 /tts calls per minute per IP."""
+    ip = _get_client_ip(request)
+    if not _check_rate(f"tts:{ip}", limit=20, window=60):
+        raise HTTPException(status_code=429, detail="Rate limit: máximo 20 TTS/min por IP")
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "facelessai"
 TEMP_DIR.mkdir(exist_ok=True)
@@ -138,7 +187,7 @@ async def diag():
 
 # ─── ENDPOINTS ───────────────────────────────────────────────
 
-@app.post("/generate", response_model=StatusResponse)
+@app.post("/generate", response_model=StatusResponse, dependencies=[Depends(require_key), Depends(rate_limit_generate)])
 async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())[:8]
     jobs[job_id] = {"status": "pending", "progress": 0, "message": "Iniciando...",
@@ -261,7 +310,7 @@ class TTSRequest(BaseModel):
     model: str = "tts-1"
     api_key: str = ""   # optional — falls back to OPENAI_API_KEY env var
 
-@app.post("/tts")
+@app.post("/tts", dependencies=[Depends(require_key), Depends(rate_limit_tts)])
 async def tts_proxy(req: TTSRequest):
     key = req.api_key or OPENAI_API_KEY
     if not key:
