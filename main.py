@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-FacelessAI Backend v1.7 — Simplified pipeline, full diagnostic logging
+FacelessAI Backend v1.8 — Simplified pipeline, full diagnostic logging
 """
 
 import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess, shutil
@@ -15,7 +15,7 @@ from pydantic import BaseModel
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 
-app = FastAPI(title="FacelessAI", version="1.7")
+app = FastAPI(title="FacelessAI", version="1.8")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "facelessai"
@@ -117,9 +117,9 @@ async def diag():
     ], capture_output=True, timeout=30)
     if r3.returncode == 0 and test_out.exists():
         results["test_video"] = f"ok — {test_out.stat().st_size} bytes"
-        test_out.unlink(missing_ok=True)
     else:
         results["test_video"] = f"FAIL: {r3.stderr.decode()[-200:]}"
+    test_out.unlink(missing_ok=True)  # always clean up
 
     # 4. Available fonts
     r4 = subprocess.run(["fc-list"], capture_output=True, text=True, timeout=10)
@@ -355,7 +355,7 @@ async def process_video(job_id: str, req: VideoRequest):
 
         for i, clip_path in enumerate(raw_clips):
             out_clip = job_dir / f"clip_proc_{i}.mp4"
-            ok = process_one_clip(clip_path, str(out_clip), clip_dur, req.fps)
+            ok = process_one_clip(clip_path, str(out_clip), clip_dur, req.fps, req.zoom_effect)
             if ok:
                 processed.append(str(out_clip))
                 size_kb = Path(out_clip).stat().st_size // 1024
@@ -392,6 +392,25 @@ async def process_video(job_id: str, req: VideoRequest):
         out_size = output_path.stat().st_size
         upd("processing", 90, f"Video compuesto OK — {out_size//1024}KB")
 
+        # STEP 5.5: Burn subtitles (only if subtitle_style set and script provided)
+        if req.subtitle_style and req.subtitle_style not in ('none', '') and req.script and duration > 0:
+            srt_path = job_dir / f"{job_id}.srt"
+            generate_srt(req.script, duration, str(srt_path))
+            srt_out = TEMP_DIR / f"{job_id}_subs.mp4"
+            upd("processing", 92, "Quemando subtítulos...")
+            style = "Fontsize=16,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Bold=1,Alignment=2,MarginV=60"
+            sub_r = subprocess.run([
+                "ffmpeg", "-y", "-i", str(output_path),
+                "-vf", f"subtitles={str(srt_path)}:force_style='{style}'",
+                "-c:a", "copy", str(srt_out)
+            ], capture_output=True, timeout=180)
+            if sub_r.returncode == 0 and srt_out.exists() and srt_out.stat().st_size > 1000:
+                output_path.unlink(missing_ok=True)
+                shutil.move(str(srt_out), str(output_path))
+                upd("processing", 94, "Subtítulos aplicados OK")
+            else:
+                upd("processing", 94, f"Subtítulos fallaron — vídeo sin subs ({sub_r.stderr.decode()[-80:].strip()})")
+
         # STEP 6: Thumbnail
         upd("processing", 95, "Generando thumbnail...")
         thumb_path = TEMP_DIR / f"{job_id}_thumb.jpg"
@@ -409,7 +428,6 @@ async def process_video(job_id: str, req: VideoRequest):
         })
         _save_jobs(jobs)
         print(f"JOB {job_id} DONE — {out_size//1024}KB")
-        shutil.rmtree(str(job_dir), ignore_errors=True)
 
     except Exception as e:
         err_msg = str(e)
@@ -420,6 +438,9 @@ async def process_video(job_id: str, req: VideoRequest):
             "message": f"Error: {err_msg[:400]}"
         })
         _save_jobs(jobs)
+
+    finally:
+        shutil.rmtree(str(job_dir), ignore_errors=True)
 
 # ─── HELPERS ─────────────────────────────────────────────────
 
@@ -443,7 +464,7 @@ async def download_clips(urls: list, job_dir: Path, upd) -> list:
     return paths
 
 
-def process_one_clip(input_path: str, output_path: str, duration: float, fps: int) -> bool:
+def process_one_clip(input_path: str, output_path: str, duration: float, fps: int, zoom_effect: bool = False) -> bool:
     """Convert one clip to 1080x1920 portrait, no audio. 3 attempts."""
 
     # Probe input
@@ -459,13 +480,14 @@ def process_one_clip(input_path: str, output_path: str, duration: float, fps: in
     except Exception:
         w, h = 0, 0
 
-    # Build vf based on orientation
+    # Build vf based on orientation; optionally add 10% zoom-in crop
+    zoom_suffix = ",scale=1188:2112,crop=1080:1920" if zoom_effect else ""
     if w > 0 and h > 0 and w > h:
         # Landscape → crop to portrait then scale
-        vf = "crop=ih*9/16:ih,scale=1080:1920"
+        vf = "crop=ih*9/16:ih,scale=1080:1920" + zoom_suffix
     else:
         # Portrait or unknown → scale with padding
-        vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
+        vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" + zoom_suffix
 
     base_cmd = [
         "ffmpeg", "-y",
