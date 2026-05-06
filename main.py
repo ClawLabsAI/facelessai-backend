@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-FacelessAI Backend v2.0 — Simplified pipeline, full diagnostic logging
+FacelessAI Backend v2.1 — TikTok OAuth proxy, Scale tier cleanup
 """
 
 import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess, shutil, time
@@ -15,11 +15,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from typing import Optional as Opt
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
-FAI_SECRET_KEY = os.getenv("FAI_SECRET_KEY", "")   # if empty → auth disabled (dev mode)
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+PEXELS_API_KEY   = os.getenv("PEXELS_API_KEY", "")
+FAI_SECRET_KEY   = os.getenv("FAI_SECRET_KEY", "")    # if empty → auth disabled (dev mode)
+TT_CLIENT_KEY    = os.getenv("TT_CLIENT_KEY", "")     # TikTok OAuth client_key
+TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")  # TikTok OAuth client_secret
 
-app = FastAPI(title="FacelessAI", version="2.0")
+app = FastAPI(title="FacelessAI", version="2.1")
 
 ALLOWED_ORIGINS = [
     "https://clawlabsai.github.io",
@@ -99,6 +101,11 @@ class StatusResponse(BaseModel):
     message: str
     download_url: Optional[str] = None
     thumbnail_url: Optional[str] = None
+
+class TTTokenRequest(BaseModel):
+    code: str
+    redirect_uri: str
+    client_key: Optional[str] = None   # can be overridden by caller; falls back to env var
 
 JOBS_FILE = TEMP_DIR / "jobs.json"
 
@@ -355,6 +362,50 @@ async def pexels_search(query: str, per_page: int = 6, orientation: str = "portr
                 raise HTTPException(status_code=401, detail="Invalid Pexels API key")
             r.raise_for_status()
         return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tt/token", dependencies=[Depends(require_key)])
+async def tiktok_token_exchange(req: TTTokenRequest):
+    """
+    Server-side TikTok OAuth2 code → token exchange.
+    TikTok requires client_secret which must never be exposed in the browser.
+    Docs: https://developers.tiktok.com/doc/oauth-user-access-token-management
+    """
+    client_key    = req.client_key or TT_CLIENT_KEY
+    client_secret = TT_CLIENT_SECRET
+    if not client_key or not client_secret:
+        raise HTTPException(
+            status_code=501,
+            detail="TikTok OAuth not configured. Set TT_CLIENT_KEY and TT_CLIENT_SECRET in Railway env vars."
+        )
+    try:
+        async with httpx.AsyncClient(timeout=20) as cl:
+            r = await cl.post(
+                "https://open.tiktokapis.com/v2/oauth/token/",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "client_key":    client_key,
+                    "client_secret": client_secret,
+                    "code":          req.code,
+                    "grant_type":    "authorization_code",
+                    "redirect_uri":  req.redirect_uri,
+                }
+            )
+            body = r.json()
+            if r.status_code != 200:
+                raise HTTPException(status_code=r.status_code, detail=body.get("message", str(body)))
+            # Return only the fields the frontend needs — never log the secret
+            return {
+                "access_token":  body.get("access_token"),
+                "refresh_token": body.get("refresh_token"),
+                "expires_in":    body.get("expires_in"),
+                "open_id":       body.get("open_id"),
+                "scope":         body.get("scope"),
+            }
     except HTTPException:
         raise
     except Exception as e:
