@@ -1,21 +1,22 @@
 from __future__ import annotations
 """
-FacelessAI Backend v1.8 — Simplified pipeline, full diagnostic logging
+FacelessAI Backend v1.9 — Simplified pipeline, full diagnostic logging
 """
 
 import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess, shutil
 from pathlib import Path
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional as Opt
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 
-app = FastAPI(title="FacelessAI", version="1.8")
+app = FastAPI(title="FacelessAI", version="1.9")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "facelessai"
@@ -174,13 +175,17 @@ async def get_thumbnail(job_id: str):
 # ─── YOUTUBE ANALYTICS ───────────────────────────────────────
 
 @app.get("/yt/channel-stats")
-async def yt_channel_stats(channel_id: str, access_token: str):
+async def yt_channel_stats(channel_id: str, authorization: Opt[str] = Header(None), access_token: Opt[str] = None):
+    # Accept token from Authorization header (preferred) or query param (legacy)
+    token = (authorization.removeprefix("Bearer ").strip() if authorization else None) or access_token or ""
+    if not token:
+        raise HTTPException(status_code=401, detail="Token OAuth requerido (header Authorization: Bearer <token>)")
     try:
         async with httpx.AsyncClient(timeout=15) as cl:
             r = await cl.get(
                 "https://www.googleapis.com/youtube/v3/channels",
                 params={"part": "statistics,snippet", "id": channel_id},
-                headers={"Authorization": f"Bearer {access_token}"}
+                headers={"Authorization": f"Bearer {token}"}
             )
             if r.status_code == 401:
                 raise HTTPException(status_code=401, detail="Token OAuth expirado")
@@ -204,13 +209,16 @@ async def yt_channel_stats(channel_id: str, access_token: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/yt/recent-videos")
-async def yt_recent_videos(channel_id: str, access_token: str, max_results: int = 10):
+async def yt_recent_videos(channel_id: str, max_results: int = 10, authorization: Opt[str] = Header(None), access_token: Opt[str] = None):
+    token = (authorization.removeprefix("Bearer ").strip() if authorization else None) or access_token or ""
+    if not token:
+        raise HTTPException(status_code=401, detail="Token OAuth requerido")
     try:
         async with httpx.AsyncClient(timeout=20) as cl:
             ch_r = await cl.get(
                 "https://www.googleapis.com/youtube/v3/channels",
                 params={"part": "contentDetails", "id": channel_id},
-                headers={"Authorization": f"Bearer {access_token}"}
+                headers={"Authorization": f"Bearer {token}"}
             )
             ch_r.raise_for_status()
             uploads_id = (ch_r.json().get("items", [{}])[0]
@@ -220,7 +228,7 @@ async def yt_recent_videos(channel_id: str, access_token: str, max_results: int 
             pl_r = await cl.get(
                 "https://www.googleapis.com/youtube/v3/playlistItems",
                 params={"part": "contentDetails,snippet", "playlistId": uploads_id, "maxResults": max_results},
-                headers={"Authorization": f"Bearer {access_token}"}
+                headers={"Authorization": f"Bearer {token}"}
             )
             pl_r.raise_for_status()
             video_ids = [it["contentDetails"]["videoId"] for it in pl_r.json().get("items", [])]
@@ -229,7 +237,7 @@ async def yt_recent_videos(channel_id: str, access_token: str, max_results: int 
             sr = await cl.get(
                 "https://www.googleapis.com/youtube/v3/videos",
                 params={"part": "statistics,snippet", "id": ",".join(video_ids)},
-                headers={"Authorization": f"Bearer {access_token}"}
+                headers={"Authorization": f"Bearer {token}"}
             )
             sr.raise_for_status()
             return {"videos": [
