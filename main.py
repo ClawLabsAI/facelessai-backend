@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-FacelessAI Backend v1.5 — Simplified pipeline, full diagnostic logging
+FacelessAI Backend v1.7 — Simplified pipeline, full diagnostic logging
 """
 
 import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess, shutil
@@ -15,7 +15,7 @@ from pydantic import BaseModel
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 
-app = FastAPI(title="FacelessAI", version="1.6")
+app = FastAPI(title="FacelessAI", version="1.7")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "facelessai"
@@ -50,7 +50,23 @@ class StatusResponse(BaseModel):
     download_url: Optional[str] = None
     thumbnail_url: Optional[str] = None
 
-jobs: dict = {}
+JOBS_FILE = TEMP_DIR / "jobs.json"
+
+def _load_jobs() -> dict:
+    try:
+        if JOBS_FILE.exists():
+            return json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_jobs(j: dict):
+    try:
+        JOBS_FILE.write_text(json.dumps(j), encoding="utf-8")
+    except Exception:
+        pass
+
+jobs: dict = _load_jobs()
 
 # ─── HEALTH + DIAGNOSTICS ────────────────────────────────────
 
@@ -126,6 +142,7 @@ async def generate_video(req: VideoRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())[:8]
     jobs[job_id] = {"status": "pending", "progress": 0, "message": "Iniciando...",
                     "download_url": None, "thumbnail_url": None}
+    _save_jobs(jobs)
     background_tasks.add_task(process_video, job_id, req)
     return StatusResponse(job_id=job_id, status="pending", progress=0, message="Job creado")
 
@@ -390,6 +407,7 @@ async def process_video(job_id: str, req: VideoRequest):
             "download_url": f"/download/{job_id}",
             "thumbnail_url": f"/thumbnail/{job_id}" if thumb_path.exists() else None,
         })
+        _save_jobs(jobs)
         print(f"JOB {job_id} DONE — {out_size//1024}KB")
         shutil.rmtree(str(job_dir), ignore_errors=True)
 
@@ -401,6 +419,7 @@ async def process_video(job_id: str, req: VideoRequest):
             "status": "error", "progress": 0,
             "message": f"Error: {err_msg[:400]}"
         })
+        _save_jobs(jobs)
 
 # ─── HELPERS ─────────────────────────────────────────────────
 
