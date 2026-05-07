@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-FacelessAI Backend v2.1 — TikTok OAuth proxy, Scale tier cleanup
+FacelessAI Backend v2.2 — Fal.ai video generation (Wan2.1 / Kling v2)
 """
 
 import os, re, uuid, json, httpx, random, asyncio, tempfile, base64, subprocess, shutil, time
@@ -20,8 +20,9 @@ PEXELS_API_KEY   = os.getenv("PEXELS_API_KEY", "")
 FAI_SECRET_KEY   = os.getenv("FAI_SECRET_KEY", "")    # if empty → auth disabled (dev mode)
 TT_CLIENT_KEY    = os.getenv("TT_CLIENT_KEY", "")     # TikTok OAuth client_key
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")  # TikTok OAuth client_secret
+FAL_API_KEY      = os.getenv("FAL_API_KEY", "")       # fal.ai video generation
 
-app = FastAPI(title="FacelessAI", version="2.1")
+app = FastAPI(title="FacelessAI", version="2.2")
 
 ALLOWED_ORIGINS = [
     "https://clawlabsai.github.io",
@@ -106,6 +107,12 @@ class TTTokenRequest(BaseModel):
     code: str
     redirect_uri: str
     client_key: Optional[str] = None   # can be overridden by caller; falls back to env var
+
+class FalVideoRequest(BaseModel):
+    prompt: str
+    duration: float = 5.0        # seconds (approx)
+    resolution: str = "720p"     # 480p or 720p
+    model: str = "wan-1.3b"      # wan-1.3b | wan-14b | kling-v2
 
 JOBS_FILE = TEMP_DIR / "jobs.json"
 
@@ -410,6 +417,119 @@ async def tiktok_token_exchange(req: TTTokenRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── FAL.AI VIDEO GENERATION ─────────────────────────────────
+
+FAL_MODELS = {
+    "wan-1.3b": "fal-ai/wan/v2/1.3b/text-to-video",
+    "wan-14b":  "fal-ai/wan/v2/14b/text-to-video",
+    "kling-v2": "fal-ai/kling-video/v2/master/text-to-video",
+}
+
+@app.post("/fal/generate", response_model=StatusResponse, dependencies=[Depends(require_key)])
+async def fal_generate(req: FalVideoRequest, background_tasks: BackgroundTasks):
+    """Submit an AI video generation job via fal.ai (Wan2.1 / Kling v2)."""
+    if not FAL_API_KEY:
+        raise HTTPException(
+            status_code=501,
+            detail="FAL_API_KEY no configurada. Añade la variable en Railway → Variables."
+        )
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "queued", "progress": 0, "message": "En cola fal.ai...",
+                    "download_url": None, "thumbnail_url": None}
+    _save_jobs(jobs)
+    background_tasks.add_task(process_fal_video, job_id, req)
+    return StatusResponse(job_id=job_id, status="queued", progress=0, message="En cola fal.ai...")
+
+
+async def process_fal_video(job_id: str, req: FalVideoRequest):
+    """Background task: submit to fal.ai queue, poll until done, save video URL."""
+    def upd(status: str, pct: int, msg: str):
+        jobs[job_id].update({"status": status, "progress": pct, "message": msg})
+        _save_jobs(jobs)
+
+    try:
+        model_id     = FAL_MODELS.get(req.model, FAL_MODELS["wan-1.3b"])
+        fal_headers  = {"Authorization": f"Key {FAL_API_KEY}", "Content-Type": "application/json"}
+
+        # Build payload per model family
+        if "kling" in model_id:
+            payload = {
+                "prompt":       req.prompt,
+                "duration":     str(int(max(5, min(10, req.duration)))),
+                "aspect_ratio": "9:16",
+            }
+        else:
+            # Wan2.1 — 16 fps; clamp frames to Wan limits (16–121)
+            num_frames = max(16, min(121, int(req.duration * 16)))
+            payload = {
+                "prompt":       req.prompt,
+                "num_frames":   num_frames,
+                "resolution":   req.resolution,
+                "aspect_ratio": "9:16",
+            }
+
+        upd("processing", 5, f"Enviando a fal.ai ({req.model})...")
+        print(f"FAL JOB {job_id}: model={req.model} prompt={req.prompt[:60]}")
+
+        # ── Submit to fal.ai queue ──────────────────────────────
+        async with httpx.AsyncClient(timeout=30) as cl:
+            r = await cl.post(f"https://queue.fal.run/{model_id}",
+                              headers=fal_headers, json=payload)
+            if r.status_code == 401:
+                raise Exception("FAL_API_KEY inválida — comprueba la variable en Railway")
+            r.raise_for_status()
+            q = r.json()
+
+        request_id   = q.get("request_id", "")
+        status_url   = q.get("status_url",
+                             f"https://queue.fal.run/{model_id}/requests/{request_id}/status")
+        response_url = q.get("response_url",
+                             f"https://queue.fal.run/{model_id}/requests/{request_id}")
+
+        upd("processing", 15, "Generando vídeo IA...")
+
+        # ── Poll until COMPLETED (max ~12 min, 72 × 10 s) ───────
+        for attempt in range(72):
+            await asyncio.sleep(10)
+            async with httpx.AsyncClient(timeout=20) as cl:
+                sr = await cl.get(status_url, headers=fal_headers)
+                sr.raise_for_status()
+                sd = sr.json()
+
+            fal_status = sd.get("status", "")
+            print(f"FAL JOB {job_id} poll #{attempt}: {fal_status}")
+
+            if fal_status == "COMPLETED":
+                # Fetch result
+                async with httpx.AsyncClient(timeout=20) as cl:
+                    rr = await cl.get(response_url, headers=fal_headers)
+                    rr.raise_for_status()
+                    result = rr.json()
+
+                video_url = (result.get("video") or {}).get("url") or result.get("video_url", "")
+                if not video_url:
+                    raise Exception(f"Sin video URL en respuesta fal.ai: {list(result.keys())}")
+
+                jobs[job_id]["download_url"] = video_url
+                upd("done", 100, "Vídeo IA generado ✓")
+                print(f"FAL JOB {job_id} done: {video_url[:60]}")
+                return
+
+            elif fal_status in ("FAILED", "CANCELLED"):
+                err = sd.get("error") or sd.get("detail", "error desconocido")
+                raise Exception(f"Fal.ai {fal_status}: {err}")
+
+            pct = min(15 + int(attempt * 1.1), 90)
+            upd("processing", pct, f"Generando... ({attempt * 10}s)")
+
+        raise Exception("Timeout: fal.ai tardó más de 12 minutos")
+
+    except Exception as e:
+        print(f"FAL JOB {job_id} ERROR: {e}")
+        jobs[job_id].update({"status": "error", "progress": 0, "message": str(e)})
+        _save_jobs(jobs)
 
 
 # ─── CORE PROCESSING ─────────────────────────────────────────
